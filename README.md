@@ -34,6 +34,14 @@ docker build -t cloxy .
 docker run -p 9055:9055 -v cloxy-data:/data cloxy
 ```
 
+### Docker Compose (recommended)
+
+```bash
+docker compose up -d
+```
+
+That's it. Cloxy runs on `http://localhost:9055` with persistent storage.
+
 ## Usage
 
 ### Fetch a webpage
