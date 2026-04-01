@@ -3,8 +3,18 @@
 CLOXY — Give your local AI eyes and memory.
 Web proxy + conversation RAG for local LLMs and AI coding tools.
 
+v3.0 — Rebuilt with:
+  - Numpy matrix vector search (batch cosine sim, no Python loops)
+  - aiosqlite for async-safe database access
+  - SHA256 content hashing
+  - FastAPI lifespan (no deprecated on_event)
+  - Optional API key auth
+  - TTL cache via cachetools
+  - In-memory vector index with auto-reload from DB
+
 Usage:
-    pip install fastapi uvicorn httpx trafilatura markdownify beautifulsoup4 fastembed numpy
+    pip install fastapi uvicorn httpx trafilatura markdownify beautifulsoup4 \
+                fastembed numpy aiosqlite cachetools
     python cloxy.py
 
     # Fetch a webpage
@@ -18,6 +28,8 @@ Usage:
     # Recall from memory
     curl -X POST http://localhost:9055/recall -H "Content-Type: application/json" \
         -d '{"query": "what did we build last week"}'
+
+Roy Gurner | Occam Engineering | 2026
 """
 import os
 import sys
@@ -27,8 +39,9 @@ import json
 import re
 import glob as globmod
 import struct
-import sqlite3
 import logging
+import threading
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional, List
 from urllib.parse import urlparse
@@ -37,25 +50,24 @@ from pathlib import Path
 import httpx
 import trafilatura
 import numpy as np
+import aiosqlite
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
 from fastembed import TextEmbedding
-from fastapi import FastAPI, Request, Query, Form
+from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
-
-# --- App ---
-app = FastAPI(title="CLOXY", version="2.0")
-logger = logging.getLogger("cloxy")
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s")
+from cachetools import TTLCache
 
 # --- Config ---
 PORT = int(os.environ.get("CLOXY_PORT", 9055))
 DATA_DIR = os.environ.get("CLOXY_DATA_DIR", os.path.expanduser("~/.cloxy"))
 DB_PATH = os.path.join(DATA_DIR, "memory.db")
-START_TIME = time.time()
+API_KEY = os.environ.get("CLOXY_API_KEY", "")  # empty = no auth
 USER_AGENT = os.environ.get("CLOXY_USER_AGENT",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 FETCH_TIMEOUT = float(os.environ.get("CLOXY_FETCH_TIMEOUT", 30))
 MAX_CONTENT_LENGTH = 500_000
 
@@ -65,25 +77,134 @@ EMBED_DIM = 384
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
 
-# --- Cache (in-memory, 15 min TTL) ---
-_cache = {}
-CACHE_TTL = 900
+# --- Logging ---
+logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s %(message)s")
+logger = logging.getLogger("cloxy")
+
+# --- Cache (TTL 15 min, max 200 entries) ---
+_cache: TTLCache = TTLCache(maxsize=200, ttl=900)
 
 # --- Globals ---
+START_TIME = time.time()
 embedder: TextEmbedding = None
-db: sqlite3.Connection = None
+_db_pool: aiosqlite.Connection = None
+
+
+# =============================================================================
+# VECTOR INDEX — In-memory numpy matrix for fast cosine similarity
+# =============================================================================
+
+class VectorIndex:
+    """
+    In-memory vector index backed by a normalized numpy matrix.
+    Recall is a single matrix multiply — no Python loops, no full table scan.
+    Auto-syncs with SQLite on insert and startup.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._ids: List[int] = []
+        self._matrix: Optional[np.ndarray] = None  # (N, dim) normalized
+
+    def load(self, ids: List[int], embeddings: List[np.ndarray]):
+        """Bulk load from database on startup."""
+        with self._lock:
+            if not ids:
+                self._ids = []
+                self._matrix = None
+                return
+            self._ids = list(ids)
+            mat = np.vstack(embeddings).astype(np.float32)
+            # Normalize rows for cosine similarity via dot product
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            self._matrix = mat / norms
+
+    def add(self, chunk_id: int, embedding: np.ndarray):
+        """Add a single vector to the index."""
+        with self._lock:
+            vec = embedding.astype(np.float32).reshape(1, -1)
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vec = vec / norm
+            self._ids.append(chunk_id)
+            if self._matrix is None:
+                self._matrix = vec
+            else:
+                self._matrix = np.vstack([self._matrix, vec])
+
+    def add_batch(self, ids: List[int], embeddings: List[np.ndarray]):
+        """Add multiple vectors at once."""
+        with self._lock:
+            mat = np.vstack(embeddings).astype(np.float32)
+            norms = np.linalg.norm(mat, axis=1, keepdims=True)
+            norms[norms == 0] = 1.0
+            mat = mat / norms
+            self._ids.extend(ids)
+            if self._matrix is None:
+                self._matrix = mat
+            else:
+                self._matrix = np.vstack([self._matrix, mat])
+
+    def search(self, query_embedding: np.ndarray, top_k: int = 5) -> List[tuple]:
+        """
+        Returns list of (chunk_id, similarity_score) sorted by relevance.
+        Single matrix multiply — O(N) but vectorized in C, not Python.
+        """
+        with self._lock:
+            if self._matrix is None or len(self._ids) == 0:
+                return []
+            q = query_embedding.astype(np.float32).reshape(1, -1)
+            norm = np.linalg.norm(q)
+            if norm > 0:
+                q = q / norm
+            # Cosine similarity via dot product (both sides normalized)
+            scores = (self._matrix @ q.T).flatten()
+            k = min(top_k, len(scores))
+            top_indices = np.argpartition(scores, -k)[-k:]
+            top_indices = top_indices[np.argsort(scores[top_indices])[::-1]]
+            return [(self._ids[i], float(scores[i])) for i in top_indices]
+
+    @property
+    def size(self) -> int:
+        with self._lock:
+            return len(self._ids)
+
+
+vec_index = VectorIndex()
+
+
+# =============================================================================
+# AUTH
+# =============================================================================
+
+_api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+
+async def check_auth(api_key: Optional[str] = Depends(_api_key_header)):
+    """Optional API key auth. Skipped if CLOXY_API_KEY is not set."""
+    if API_KEY and api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
 # =============================================================================
 # DATABASE
 # =============================================================================
 
-def init_db():
-    global db
+async def get_db() -> aiosqlite.Connection:
+    return _db_pool
+
+
+async def init_db():
+    """Initialize async SQLite database."""
+    global _db_pool
     os.makedirs(DATA_DIR, exist_ok=True)
-    db = sqlite3.connect(DB_PATH, check_same_thread=False)
-    db.execute("PRAGMA journal_mode=WAL")
-    db.execute("""
+    _db_pool = await aiosqlite.connect(DB_PATH)
+    _db_pool.row_factory = aiosqlite.Row
+
+    await _db_pool.execute("PRAGMA journal_mode=WAL")
+
+    await _db_pool.execute("""
         CREATE TABLE IF NOT EXISTS chunks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             content TEXT NOT NULL,
@@ -93,9 +214,40 @@ def init_db():
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    db.execute("CREATE INDEX IF NOT EXISTS idx_hash ON chunks(content_hash)")
-    db.commit()
+    await _db_pool.execute("CREATE INDEX IF NOT EXISTS idx_hash ON chunks(content_hash)")
+    await _db_pool.commit()
     logger.info(f"Database ready at {DB_PATH}")
+
+
+async def load_vector_index():
+    """Load all embeddings from DB into the in-memory vector index."""
+    db = await get_db()
+    rows = await db.execute_fetchall(
+        "SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL"
+    )
+    if not rows:
+        logger.info("Vector index: empty (no embeddings in DB)")
+        return
+
+    ids = []
+    embeddings = []
+    for row in rows:
+        chunk_id = row[0]
+        blob = row[1]
+        n = len(blob) // 4
+        vec = np.array(struct.unpack(f"{n}f", blob), dtype=np.float32)
+        ids.append(chunk_id)
+        embeddings.append(vec)
+
+    vec_index.load(ids, embeddings)
+    logger.info(f"Vector index: loaded {len(ids)} embeddings into memory")
+
+
+async def close_db():
+    global _db_pool
+    if _db_pool:
+        await _db_pool.close()
+        _db_pool = None
 
 
 def init_embedder():
@@ -103,6 +255,24 @@ def init_embedder():
     logger.info(f"Loading embedding model: {EMBED_MODEL}")
     embedder = TextEmbedding(model_name=EMBED_MODEL)
     logger.info("Embedding model loaded")
+
+
+# =============================================================================
+# LIFESPAN
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await init_db()
+    init_embedder()
+    await load_vector_index()
+    logger.info(f"CLOXY v3.0 ready on port {PORT}")
+    yield
+    await close_db()
+    logger.info("CLOXY shut down")
+
+
+app = FastAPI(title="CLOXY", version="3.0", lifespan=lifespan)
 
 
 # =============================================================================
@@ -121,17 +291,6 @@ def pack_embedding(vec: np.ndarray) -> bytes:
     return struct.pack(f"{len(vec)}f", *vec)
 
 
-def unpack_embedding(blob: bytes) -> np.ndarray:
-    n = len(blob) // 4
-    return np.array(struct.unpack(f"{n}f", blob), dtype=np.float32)
-
-
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    dot = np.dot(a, b)
-    norm = np.linalg.norm(a) * np.linalg.norm(b)
-    return float(dot / norm) if norm > 0 else 0.0
-
-
 # =============================================================================
 # TEXT CHUNKING
 # =============================================================================
@@ -143,7 +302,6 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
         end = pos + size
         chunk = text[pos:end]
         if end < len(text):
-            # Try to break on paragraph or sentence boundary
             for sep in ["\n\n", "\n", ". ", "! ", "? "]:
                 last = chunk.rfind(sep)
                 if last > size // 3:
@@ -162,7 +320,6 @@ def chunk_text(text: str, size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) 
 # =============================================================================
 
 def parse_convo_jsonl(filepath: str) -> List[dict]:
-    """Parse a Claude Code conversation JSONL into clean message turns."""
     messages = []
     with open(filepath, "r") as f:
         for line in f:
@@ -193,7 +350,6 @@ def parse_convo_jsonl(filepath: str) -> List[dict]:
             if not text:
                 continue
 
-            # Strip system reminders
             text = re.sub(r"<system-reminder>.*?</system-reminder>", "", text, flags=re.DOTALL).strip()
             if not text:
                 continue
@@ -208,7 +364,6 @@ def parse_convo_jsonl(filepath: str) -> List[dict]:
 
 
 def chunk_conversation(messages: List[dict], session_id: str) -> List[dict]:
-    """Turn conversation messages into labeled chunks for RAG."""
     dialogue = []
     for msg in messages:
         prefix = "USER" if msg["role"] == "user" else "ASSISTANT"
@@ -224,12 +379,24 @@ def chunk_conversation(messages: List[dict], session_id: str) -> List[dict]:
 
 
 # =============================================================================
+# HASHING
+# =============================================================================
+
+def content_hash(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def cache_key(url: str, mode: str) -> str:
+    return hashlib.sha256(f"{url}:{mode}".encode()).hexdigest()
+
+
+# =============================================================================
 # REQUEST MODELS
 # =============================================================================
 
 class FetchRequest(BaseModel):
     url: str
-    mode: str = "clean"           # clean | raw | markdown | extract
+    mode: str = "clean"
     selector: Optional[str] = None
     headers: Optional[dict] = None
 
@@ -256,37 +423,15 @@ class RecallRequest(BaseModel):
 
 
 # =============================================================================
-# CACHE
-# =============================================================================
-
-def _cache_key(url: str, mode: str) -> str:
-    return hashlib.md5(f"{url}:{mode}".encode()).hexdigest()
-
-
-def _get_cached(key: str) -> Optional[dict]:
-    if key in _cache:
-        entry = _cache[key]
-        if time.time() - entry["ts"] < CACHE_TTL:
-            return entry["data"]
-        del _cache[key]
-    return None
-
-
-def _set_cache(key: str, data: dict):
-    _cache[key] = {"ts": time.time(), "data": data}
-    if len(_cache) > 100:
-        oldest = sorted(_cache.items(), key=lambda x: x[1]["ts"])
-        for k, _ in oldest[:20]:
-            del _cache[k]
-
-
-# =============================================================================
 # ENDPOINTS — WEB PROXY
 # =============================================================================
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    doc_count = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] if db else 0
+    db = await get_db()
+    row = await db.execute_fetchall("SELECT COUNT(*) as cnt FROM chunks")
+    doc_count = row[0][0] if row else 0
+    auth_status = "ENABLED" if API_KEY else "DISABLED"
     return f"""
 <pre style="color:#0f0;background:#111;padding:20px;font-family:monospace">
    _____ _     _____ __  ____   __
@@ -297,7 +442,7 @@ async def index():
   \\_____|_____\\____/_/  \\_\\ |_|
 
   Give your local AI eyes and memory.
-  v2.0 — Port {PORT} — {doc_count} memories
+  v3.0 — Port {PORT} — {doc_count} memories — Auth {auth_status}
 
   WEB PROXY:
     POST /fetch          — Fetch and clean a URL
@@ -306,7 +451,7 @@ async def index():
   MEMORY:
     POST /ingest_convos  — Parse Claude Code conversations into memory
     POST /ingest_text    — Store any text into memory
-    POST /recall         — Search conversation memory
+    POST /recall         — Search conversation memory (vector index)
     GET  /memory_stats   — Memory stats
 
   HEALTH:
@@ -318,20 +463,24 @@ async def index():
 
 @app.get("/health")
 async def health():
-    doc_count = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] if db else 0
+    db = await get_db()
+    row = await db.execute_fetchall("SELECT COUNT(*) FROM chunks")
+    doc_count = row[0][0] if row else 0
     return {
         "status": "OK",
         "service": "cloxy",
-        "version": "2.0",
+        "version": "3.0",
         "uptime": round(time.time() - START_TIME),
-        "cache_size": len(_cache),
+        "cache_size": _cache.currsize,
         "memories": doc_count,
+        "vector_index_size": vec_index.size,
         "embed_model": EMBED_MODEL,
+        "auth": "enabled" if API_KEY else "disabled",
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
 
-@app.post("/fetch")
+@app.post("/fetch", dependencies=[Depends(check_auth)])
 async def fetch(req: FetchRequest):
     logger.info(f"FETCH url={req.url} mode={req.mode}")
 
@@ -339,8 +488,8 @@ async def fetch(req: FetchRequest):
     if parsed.scheme not in ("http", "https"):
         return JSONResponse(status_code=400, content={"error": "URL must be http or https"})
 
-    ckey = _cache_key(req.url, req.mode)
-    cached = _get_cached(ckey)
+    ckey = cache_key(req.url, req.mode)
+    cached = _cache.get(ckey)
     if cached:
         cached["from_cache"] = True
         return cached
@@ -400,13 +549,12 @@ async def fetch(req: FetchRequest):
         result["matches"] = len(elements)
         result["length"] = len(result["content"])
 
-    _set_cache(ckey, result)
+    _cache[ckey] = result
     return result
 
 
-@app.post("/search")
+@app.post("/search", dependencies=[Depends(check_auth)])
 async def search_extract(req: SearchExtract):
-    """Fetch a URL and return lines matching a pattern with context."""
     logger.info(f"SEARCH url={req.url} pattern={req.pattern}")
 
     try:
@@ -441,9 +589,8 @@ async def search_extract(req: SearchExtract):
 # ENDPOINTS — MEMORY
 # =============================================================================
 
-@app.post("/ingest_convos")
+@app.post("/ingest_convos", dependencies=[Depends(check_auth)])
 async def ingest_convos(req: IngestConvoRequest):
-    """Parse Claude Code conversation JSONLs and embed into memory."""
     logger.info(f"INGEST_CONVOS dir={req.convo_dir} pattern={req.file_pattern}")
 
     convo_dir = os.path.expanduser(req.convo_dir)
@@ -455,6 +602,7 @@ async def ingest_convos(req: IngestConvoRequest):
     if not files:
         return JSONResponse(status_code=400, content={"error": "No matching files found"})
 
+    db = await get_db()
     total_chunks = 0
     total_stored = 0
     total_dupes = 0
@@ -473,11 +621,11 @@ async def ingest_convos(req: IngestConvoRequest):
             chunks = chunk_conversation(messages, session_id)
             total_chunks += len(chunks)
 
-            # Dedupe and embed
             new_chunks = []
             for chunk in chunks:
-                h = hashlib.md5(chunk["text"].encode()).hexdigest()
-                exists = db.execute("SELECT 1 FROM chunks WHERE content_hash = ?", (h,)).fetchone()
+                h = content_hash(chunk["text"])
+                row = await db.execute("SELECT 1 FROM chunks WHERE content_hash = ?", (h,))
+                exists = await row.fetchone()
                 if not exists:
                     new_chunks.append((chunk["text"], h, chunk["source"]))
                 else:
@@ -487,12 +635,18 @@ async def ingest_convos(req: IngestConvoRequest):
                 texts = [c[0] for c in new_chunks]
                 embeddings = embed_batch(texts)
 
+                new_ids = []
                 for (text, h, source), emb in zip(new_chunks, embeddings):
-                    db.execute(
+                    cursor = await db.execute(
                         "INSERT INTO chunks (content, content_hash, source, embedding) VALUES (?, ?, ?, ?)",
                         (text, h, source, pack_embedding(emb))
                     )
-                db.commit()
+                    new_ids.append(cursor.lastrowid)
+
+                await db.commit()
+
+                # Update in-memory vector index
+                vec_index.add_batch(new_ids, embeddings)
                 total_stored += len(new_chunks)
 
             processed_files += 1
@@ -511,84 +665,97 @@ async def ingest_convos(req: IngestConvoRequest):
     }
 
 
-@app.post("/ingest_text")
+@app.post("/ingest_text", dependencies=[Depends(check_auth)])
 async def ingest_text(req: IngestTextRequest):
-    """Store arbitrary text into memory."""
     logger.info(f"INGEST_TEXT source={req.source} len={len(req.text)}")
 
+    db = await get_db()
     chunks = chunk_text(req.text)
     stored = 0
 
     for i, chunk in enumerate(chunks):
-        h = hashlib.md5(chunk.encode()).hexdigest()
-        exists = db.execute("SELECT 1 FROM chunks WHERE content_hash = ?", (h,)).fetchone()
+        h = content_hash(chunk)
+        row = await db.execute("SELECT 1 FROM chunks WHERE content_hash = ?", (h,))
+        exists = await row.fetchone()
         if not exists:
             emb = embed_text(chunk)
-            db.execute(
+            cursor = await db.execute(
                 "INSERT INTO chunks (content, content_hash, source, embedding) VALUES (?, ?, ?, ?)",
                 (chunk, h, f"{req.source}:chunk{i}", pack_embedding(emb))
             )
+            vec_index.add(cursor.lastrowid, emb)
             stored += 1
 
-    db.commit()
+    await db.commit()
     return {"chunks_stored": stored, "total_chunks": len(chunks)}
 
 
-@app.post("/recall")
+@app.post("/recall", dependencies=[Depends(check_auth)])
 async def recall(req: RecallRequest):
-    """Semantic search over conversation memory."""
+    """Semantic search via in-memory numpy vector index."""
     logger.info(f"RECALL query='{req.query[:80]}' top_k={req.top_k}")
 
     query_emb = embed_text(req.query)
 
-    rows = db.execute("SELECT id, content, source, embedding FROM chunks WHERE embedding IS NOT NULL").fetchall()
+    # Single matrix multiply — no Python loop, no table scan
+    results_raw = vec_index.search(query_emb, top_k=req.top_k)
 
-    scored = []
-    for row_id, content, source, emb_blob in rows:
-        emb = unpack_embedding(emb_blob)
-        sim = cosine_similarity(query_emb, emb)
-        scored.append((sim, row_id, content, source))
+    if not results_raw:
+        return {"results": [], "query": req.query, "searched": vec_index.size}
 
-    scored.sort(reverse=True)
-    top = scored[:req.top_k]
+    # Fetch content for matched IDs
+    db = await get_db()
+    results = []
+    for chunk_id, similarity in results_raw:
+        row = await db.execute(
+            "SELECT content, source FROM chunks WHERE id = ?", (chunk_id,)
+        )
+        data = await row.fetchone()
+        if data:
+            results.append({
+                "id": chunk_id,
+                "content": data[0],
+                "source": data[1],
+                "similarity": round(similarity, 4)
+            })
 
     return {
-        "results": [
-            {"id": r[1], "content": r[2], "source": r[3], "similarity": round(r[0], 4)}
-            for r in top
-        ],
+        "results": results,
         "query": req.query,
-        "searched": len(rows),
+        "searched": vec_index.size,
     }
 
 
-@app.get("/memory_stats")
+@app.get("/memory_stats", dependencies=[Depends(check_auth)])
 async def memory_stats():
-    total = db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    with_emb = db.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL").fetchone()[0]
-    sources = db.execute("SELECT DISTINCT substr(source, 1, instr(source, ':') - 1) as src, COUNT(*) FROM chunks GROUP BY src").fetchall()
+    db = await get_db()
+
+    total_row = await db.execute_fetchall("SELECT COUNT(*) FROM chunks")
+    total = total_row[0][0] if total_row else 0
+
+    emb_row = await db.execute_fetchall("SELECT COUNT(*) FROM chunks WHERE embedding IS NOT NULL")
+    with_emb = emb_row[0][0] if emb_row else 0
+
+    sources = await db.execute_fetchall(
+        "SELECT DISTINCT substr(source, 1, instr(source, ':') - 1) as src, COUNT(*) FROM chunks GROUP BY src"
+    )
 
     return {
         "total_memories": total,
         "with_embeddings": with_emb,
+        "vector_index_size": vec_index.size,
         "sources": {s[0] if s[0] else "other": s[1] for s in sources},
-        "cache_size": len(_cache),
+        "cache_size": _cache.currsize,
         "uptime": round(time.time() - START_TIME),
         "embed_model": EMBED_MODEL,
         "db_path": DB_PATH,
+        "vector_engine": "numpy_matrix",
     }
 
 
 # =============================================================================
-# STARTUP
+# MAIN
 # =============================================================================
-
-@app.on_event("startup")
-async def startup():
-    init_db()
-    init_embedder()
-    logger.info(f"CLOXY v2.0 ready on port {PORT}")
-
 
 if __name__ == "__main__":
     import uvicorn
@@ -601,6 +768,6 @@ if __name__ == "__main__":
   \\_____|_____\\____/_/  \\_\\ |_|
 
   Give your local AI eyes and memory.
-  v2.0
+  v3.0 — numpy vector index · aiosqlite · async
 """)
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")

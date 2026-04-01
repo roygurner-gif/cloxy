@@ -18,6 +18,15 @@ Cloxy runs on your machine and provides two things:
 
 One file. One command. Your hardware, your rules.
 
+## What's New in v3.0
+
+- **Numpy matrix vector index** — pre-normalized embeddings, cosine similarity via single matrix multiply. No Python loops, no full table scans.
+- **aiosqlite** — fully async database access, no thread-safety hacks.
+- **SHA256** hashing for content dedup and cache keys.
+- **Optional API key auth** — set `CLOXY_API_KEY` to lock it down.
+- **TTL cache** via cachetools — proper eviction, no hand-rolled LRU.
+- **FastAPI lifespan** — modern lifecycle management, no deprecated decorators.
+
 ## Quick Start
 
 ```bash
@@ -101,6 +110,20 @@ curl -X POST http://localhost:9055/recall \
   -d '{"query": "what architecture did we decide on", "top_k": 5}'
 ```
 
+### With API key auth
+
+```bash
+# Set the key
+export CLOXY_API_KEY="your-secret-key"
+python cloxy.py
+
+# Include in requests
+curl -X POST http://localhost:9055/fetch \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key" \
+  -d '{"url": "https://example.com", "mode": "clean"}'
+```
+
 ### Check status
 
 ```bash
@@ -116,7 +139,7 @@ curl http://localhost:9055/memory_stats
 | `POST` | `/search` | Fetch URL, extract lines matching a pattern |
 | `POST` | `/ingest_convos` | Parse Claude Code conversations into memory |
 | `POST` | `/ingest_text` | Store any text into memory |
-| `POST` | `/recall` | Semantic search over memory |
+| `POST` | `/recall` | Semantic search over memory (numpy vector index) |
 | `GET` | `/memory_stats` | Memory database stats |
 | `GET` | `/health` | Health check |
 | `GET` | `/` | Service info |
@@ -138,6 +161,7 @@ All config via environment variables:
 |----------|---------|-------------|
 | `CLOXY_PORT` | `9055` | Server port |
 | `CLOXY_DATA_DIR` | `~/.cloxy` | Database and data directory |
+| `CLOXY_API_KEY` | *(none)* | API key for auth (empty = open) |
 | `CLOXY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model for memory |
 | `CLOXY_USER_AGENT` | Chrome UA | User agent for web requests |
 | `CLOXY_FETCH_TIMEOUT` | `30` | Web fetch timeout in seconds |
@@ -146,26 +170,25 @@ All config via environment variables:
 
 **Web Proxy**: Cloxy fetches URLs using httpx with a real browser user agent, then extracts clean content using trafilatura (the same library used by academic web scraping projects). Results are cached for 15 minutes.
 
-**Memory**: Conversations are parsed from Claude Code's JSONL format, chunked into ~1500 character segments with overlap, embedded using a local embedding model (BAAI/bge-small-en-v1.5 via fastembed), and stored in SQLite. Recall uses cosine similarity search over the embeddings.
-
-## Use Cases
-
-- **Claude Code users** who hit WebFetch content restrictions
-- **Local LLM users** (MLX, Ollama, llama.cpp) who want their model to browse the web
-- **AI coding assistants** that need persistent memory across sessions
-- **Privacy-focused developers** who want AI capabilities without cloud dependencies
-- **Self-hosters** building autonomous AI agents on their own hardware
+**Memory**: Conversations are parsed from Claude Code's JSONL format, chunked into ~1500 character segments with overlap, embedded using a local embedding model (BAAI/bge-small-en-v1.5 via fastembed), and stored in SQLite. Recall uses an in-memory numpy matrix — cosine similarity via single matrix multiply, no Python loops or table scans.
 
 ## Architecture
 
 ```
 [Your AI tool] --HTTP--> [Cloxy :9055]
                             ├── /fetch    --> httpx --> any website
-                            ├── /recall   --> SQLite + fastembed --> semantic search
-                            └── /ingest   --> chunk + embed --> SQLite
+                            ├── /recall   --> numpy vector index --> semantic search
+                            └── /ingest   --> chunk + embed --> SQLite + vec
 ```
 
 Everything runs locally. No external APIs. No telemetry. No cloud.
+
+## Stack
+
+- Python 3.12+ / FastAPI / uvicorn
+- httpx / trafilatura / BeautifulSoup / markdownify
+- fastembed (BAAI/bge-small-en-v1.5) / numpy / aiosqlite
+- cachetools (TTL cache)
 
 ## License
 
