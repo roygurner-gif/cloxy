@@ -276,7 +276,7 @@ async def lifespan(app: FastAPI):
     logger.info("CLOXY shut down")
 
 
-app = FastAPI(title="CLOXY", version="3.0", lifespan=lifespan)
+app = FastAPI(title="CLOXY", version="3.1", lifespan=lifespan)
 
 
 # =============================================================================
@@ -480,7 +480,7 @@ async def health():
     return {
         "status": "OK",
         "service": "cloxy",
-        "version": "3.0",
+        "version": "3.1",
         "uptime": round(time.time() - START_TIME),
         "cache_size": _cache.currsize,
         "memories": doc_count,
