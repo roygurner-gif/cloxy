@@ -18,7 +18,11 @@ Cloxy runs on your machine and provides two things:
 
 One file. One command. Your hardware, your rules.
 
-## What's New in v3.0
+## What's New in v3.1
+
+- **`/verify` endpoint** — fetch a URL and rank passages by semantic match to a claim. Cloxy returns the top-K most relevant chunks with cosine similarity scores; the calling agent reads them and decides support/contradiction. Reuses the `/fetch` clean-mode cache so follow-up fetches are free.
+
+## v3.0
 
 - **Numpy matrix vector index** — pre-normalized embeddings, cosine similarity via single matrix multiply. No Python loops, no full table scans.
 - **aiosqlite** — fully async database access, no thread-safety hacks.
@@ -85,6 +89,20 @@ curl -X POST http://localhost:9055/search \
   -d '{"url": "https://example.com", "pattern": "quarterly revenue"}'
 ```
 
+### Verify a claim against a webpage
+
+```bash
+curl -X POST http://localhost:9055/verify \
+  -H "Content-Type: application/json" \
+  -d '{
+    "url": "https://justice.gov/opa/pr/...",
+    "claim": "Castro was indicted for the 1996 Brothers to the Rescue shootdown",
+    "top_k": 3
+  }'
+```
+
+Returns the top-K cleaned passages from the page ranked by cosine similarity against the claim. The calling agent reads the passages and decides whether they support, contradict, or fail to address the claim. Cloxy stays a tool, not a judge.
+
 ### Ingest Claude Code conversations
 
 ```bash
@@ -136,7 +154,8 @@ curl http://localhost:9055/memory_stats
 | Method | Path | Description |
 |--------|------|-------------|
 | `POST` | `/fetch` | Fetch and clean a URL |
-| `POST` | `/search` | Fetch URL, extract lines matching a pattern |
+| `POST` | `/search` | Fetch URL, extract lines matching a pattern (keyword/substring) |
+| `POST` | `/verify` | Fetch URL, rank passages by semantic match to a claim |
 | `POST` | `/ingest_convos` | Parse Claude Code conversations into memory |
 | `POST` | `/ingest_text` | Store any text into memory |
 | `POST` | `/recall` | Semantic search over memory (numpy vector index) |

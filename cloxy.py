@@ -3,6 +3,10 @@
 CLOXY — Give your local AI eyes and memory.
 Web proxy + conversation RAG for local LLMs and AI coding tools.
 
+v3.1 — Adds:
+  - /verify endpoint: rank URL passages by semantic match to a claim
+  - Reuses /fetch clean-mode cache (no double-fetch on follow-up)
+
 v3.0 — Rebuilt with:
   - Numpy matrix vector search (batch cosine sim, no Python loops)
   - aiosqlite for async-safe database access
@@ -266,7 +270,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     init_embedder()
     await load_vector_index()
-    logger.info(f"CLOXY v3.0 ready on port {PORT}")
+    logger.info(f"CLOXY v3.1 ready on port {PORT}")
     yield
     await close_db()
     logger.info("CLOXY shut down")
@@ -422,6 +426,12 @@ class RecallRequest(BaseModel):
     top_k: int = 5
 
 
+class VerifyRequest(BaseModel):
+    url: str
+    claim: str
+    top_k: int = 3
+
+
 # =============================================================================
 # ENDPOINTS — WEB PROXY
 # =============================================================================
@@ -442,11 +452,12 @@ async def index():
   \\_____|_____\\____/_/  \\_\\ |_|
 
   Give your local AI eyes and memory.
-  v3.0 — Port {PORT} — {doc_count} memories — Auth {auth_status}
+  v3.1 — Port {PORT} — {doc_count} memories — Auth {auth_status}
 
   WEB PROXY:
     POST /fetch          — Fetch and clean a URL
-    POST /search         — Fetch URL and extract around a pattern
+    POST /search         — Fetch URL and extract around a pattern (regex/keyword)
+    POST /verify         — Fetch URL and rank passages by semantic match to a claim
 
   MEMORY:
     POST /ingest_convos  — Parse Claude Code conversations into memory
@@ -582,6 +593,130 @@ async def search_extract(req: SearchExtract):
         "pattern": req.pattern,
         "matches": matches,
         "total_matches": len(matches)
+    }
+
+
+@app.post("/verify", dependencies=[Depends(check_auth)])
+async def verify(req: VerifyRequest):
+    """
+    Fetch a URL and find passages semantically most relevant to a claim.
+
+    Returns top-K cleaned passages with cosine similarity scores against
+    the claim embedding. The calling agent reads the passages and decides
+    whether they support, contradict, or fail to address the claim —
+    Cloxy stays a tool, not a judge.
+
+    Best for: rapid fact-check of a single URL against a single claim.
+    """
+    logger.info(f"VERIFY url={req.url} claim='{req.claim[:80]}'")
+
+    parsed = urlparse(req.url)
+    if parsed.scheme not in ("http", "https"):
+        return JSONResponse(status_code=400, content={"error": "URL must be http or https"})
+
+    # Reuse /fetch clean-mode cache if present
+    ckey = cache_key(req.url, "clean")
+    cached = _cache.get(ckey)
+    if cached and cached.get("content") is not None:
+        content = cached["content"]
+        final_url = cached.get("final_url", req.url)
+        from_cache = True
+    else:
+        try:
+            async with httpx.AsyncClient(follow_redirects=True, timeout=FETCH_TIMEOUT) as client:
+                resp = await client.get(req.url, headers={"User-Agent": USER_AGENT})
+                resp.raise_for_status()
+                html = resp.text[:MAX_CONTENT_LENGTH]
+                final_url = str(resp.url)
+        except httpx.HTTPStatusError as e:
+            return JSONResponse(status_code=502, content={"error": f"HTTP {e.response.status_code}", "url": req.url})
+        except Exception as e:
+            return JSONResponse(status_code=502, content={"error": str(e), "url": req.url})
+
+        cleaned = trafilatura.extract(html, include_links=False, include_tables=True)
+        if not cleaned:
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                tag.decompose()
+            cleaned = soup.get_text(separator="\n", strip=True)
+        content = cleaned or ""
+        from_cache = False
+
+        # Populate the /fetch cache so a follow-up clean fetch is free
+        _cache[ckey] = {
+            "url": req.url,
+            "final_url": final_url,
+            "status": 200,
+            "mode": "clean",
+            "from_cache": False,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "content": content,
+            "length": len(content),
+        }
+
+    if not content:
+        return {
+            "url": req.url,
+            "final_url": final_url,
+            "claim": req.claim,
+            "matches": [],
+            "total_chunks_searched": 0,
+            "from_cache": from_cache,
+            "note": "No content extracted from URL",
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    chunks = chunk_text(content)
+    if not chunks:
+        return {
+            "url": req.url,
+            "final_url": final_url,
+            "claim": req.claim,
+            "matches": [],
+            "total_chunks_searched": 0,
+            "from_cache": from_cache,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    # Batch-embed all chunks plus the claim, then cosine similarity
+    all_embs = embed_batch(chunks + [req.claim])
+    chunk_embs = all_embs[:-1]
+    claim_emb = all_embs[-1]
+
+    mat = np.vstack(chunk_embs).astype(np.float32)
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    mat = mat / norms
+
+    q = claim_emb.astype(np.float32).reshape(1, -1)
+    qn = np.linalg.norm(q)
+    if qn > 0:
+        q = q / qn
+
+    scores = (mat @ q.T).flatten()
+    k = min(req.top_k, len(scores))
+    top_idx = np.argpartition(scores, -k)[-k:]
+    top_idx = top_idx[np.argsort(scores[top_idx])[::-1]]
+
+    matches = [
+        {
+            "passage": chunks[int(i)],
+            "similarity": round(float(scores[int(i)]), 4),
+            "chunk_index": int(i),
+            "position_pct": round(100 * int(i) / max(1, len(chunks) - 1), 1),
+        }
+        for i in top_idx
+    ]
+
+    return {
+        "url": req.url,
+        "final_url": final_url,
+        "claim": req.claim,
+        "matches": matches,
+        "total_chunks_searched": len(chunks),
+        "best_similarity": round(float(scores.max()), 4),
+        "from_cache": from_cache,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -768,6 +903,6 @@ if __name__ == "__main__":
   \\_____|_____\\____/_/  \\_\\ |_|
 
   Give your local AI eyes and memory.
-  v3.0 — numpy vector index · aiosqlite · async
+  v3.1 — numpy vector index · aiosqlite · async
 """)
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
