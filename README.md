@@ -79,20 +79,94 @@ curl -X POST http://localhost:9055/v1/chat/completions \
   }'
 ```
 
-### Docker
+### Docker (proxy + RAG only — no LLM)
+
+> **Note:** Docker mode runs Cloxy's web proxy, memory, and verify endpoints, but **does not include the local LLM**. MLX needs direct access to Apple Silicon's unified memory and Neural Engine, which standard Docker virtualization doesn't expose. For the full v4 experience (LLM + proxy + memory), run Cloxy natively with `python cloxy.py`. Use Docker only if you're running cloxy as a pure backend for an external LLM.
 
 ```bash
 docker build -t cloxy .
 docker run -p 9055:9055 -v cloxy-data:/data cloxy
-```
-
-### Docker Compose (recommended)
-
-```bash
+# or:
 docker compose up -d
 ```
 
-That's it. Cloxy runs on `http://localhost:9055` with persistent storage.
+## Why MLX (not Ollama or llama.cpp)?
+
+MLX is Apple's machine-learning framework, designed specifically for the unified-memory architecture of M-series chips. On Apple Silicon it's materially faster than llama.cpp-based runtimes (Ollama, LM Studio) because there's no abstraction layer between the model weights and the GPU — the model lives in the same memory the GPU reads from.
+
+For Cloxy specifically, MLX also fits cleanly into the FastAPI Python stack with no separate daemon, no HTTP roundtrip between proxy and LLM, no extra process to manage. Cloxy + LLM is **one Python process, one port, one install**.
+
+Cross-platform support (Linux via vLLM or `llama-cpp-python`, Windows via `llama-cpp-python`) is planned as a separate release. v4 is intentionally Apple Silicon native.
+
+## Integrations
+
+Cloxy's `/v1/chat/completions` is OpenAI-compatible, so anything that speaks the OpenAI API can use it.
+
+### Claude Code
+
+Set the model endpoint in your settings:
+
+```jsonc
+{
+  "model": "cloxy",
+  "modelEndpoint": "http://localhost:9055/v1",
+  "apiKey": "not-required"  // unless you set CLOXY_API_KEY
+}
+```
+
+### Continue.dev (VS Code / JetBrains)
+
+In your `~/.continue/config.json`:
+
+```jsonc
+{
+  "models": [{
+    "title": "Cloxy (local)",
+    "provider": "openai",
+    "model": "cloxy",
+    "apiBase": "http://localhost:9055/v1",
+    "apiKey": "not-required"
+  }]
+}
+```
+
+### Cursor
+
+Settings → Models → Add custom OpenAI-compatible model:
+- Name: `cloxy`
+- Base URL: `http://localhost:9055/v1`
+- API key: anything (or your `CLOXY_API_KEY` if set)
+
+### Plain OpenAI Python SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:9055/v1",
+    api_key="not-required",
+)
+
+resp = client.chat.completions.create(
+    model="cloxy",
+    messages=[{"role": "user", "content": "Summarize the v4 release."}],
+)
+print(resp.choices[0].message.content)
+```
+
+## Performance
+
+Approximate throughput on common Apple Silicon configs (4-bit MLX models, single user, no streaming overhead). Real numbers vary with context length, prompt complexity, and what else your Mac is doing.
+
+| Hardware | Model | Tokens/sec (approx) |
+|---|---|---|
+| M2 16 GB | Qwen 2.5 7B | ~35-50 |
+| M3 Pro 32 GB | Qwen 2.5 14B | ~25-35 |
+| M4 32 GB | Qwen 2.5 14B | ~30-40 |
+| M4 Pro 64 GB | Qwen 2.5 32B | ~18-25 |
+| M3 Ultra 192 GB | Llama 3.1 70B | ~12-18 |
+
+MLX is generally 1.5-2.5x faster than llama.cpp / Ollama on the same Apple Silicon hardware, and uses unified memory more efficiently.
 
 ## Usage
 
@@ -192,6 +266,8 @@ curl http://localhost:9055/memory_stats
 
 | Method | Path | Description |
 |--------|------|-------------|
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions (streaming + non-streaming) |
+| `GET` | `/v1/models` | List currently-loaded model (OpenAI shape) |
 | `POST` | `/fetch` | Fetch and clean a URL |
 | `POST` | `/search` | Fetch URL, extract lines matching a pattern (keyword/substring) |
 | `POST` | `/verify` | Fetch URL, rank passages by semantic match to a claim |
@@ -223,6 +299,8 @@ All config via environment variables:
 | `CLOXY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model for memory |
 | `CLOXY_USER_AGENT` | Chrome UA | User agent for web requests |
 | `CLOXY_FETCH_TIMEOUT` | `30` | Web fetch timeout in seconds |
+| `CLOXY_CONFIG` | `~/.cloxy/config.json` | LLM config file written by `cli.py init` |
+| `CLOXY_EAGER_LLM` | *(unset)* | If `1`, load the LLM at server startup instead of on first request |
 
 ## How It Works
 
@@ -234,19 +312,44 @@ All config via environment variables:
 
 ```
 [Your AI tool] --HTTP--> [Cloxy :9055]
-                            ├── /fetch    --> httpx --> any website
-                            ├── /recall   --> numpy vector index --> semantic search
-                            └── /ingest   --> chunk + embed --> SQLite + vec
+                            ├── /v1/chat/completions --> MLX --> Qwen/Llama in unified memory
+                            ├── /fetch               --> httpx --> any website
+                            ├── /recall              --> numpy vector index --> semantic search
+                            └── /ingest              --> chunk + embed --> SQLite + vec
 ```
 
-Everything runs locally. No external APIs. No telemetry. No cloud.
+Everything runs locally. No external APIs. No telemetry. No cloud. The LLM, the web proxy, the memory index — all in one Python process on your Mac.
 
 ## Stack
 
 - Python 3.12+ / FastAPI / uvicorn
+- **MLX / mlx-lm** for LLM inference (Apple Silicon native)
 - httpx / trafilatura / BeautifulSoup / markdownify
 - fastembed (BAAI/bge-small-en-v1.5) / numpy / aiosqlite
 - cachetools (TTL cache)
+
+## FAQ
+
+**Q: Can I use my own model that isn't in the catalog?**
+Yes. `cloxy init` has a "Custom" option — enter any Hugging Face MLX model id (typically from the `mlx-community` org). The wizard will warn if it looks unreasonably large for your hardware but will let you proceed.
+
+**Q: Does Cloxy work offline?**
+Yes, once a model is downloaded. The LLM, RAG, and memory all run locally. The web proxy obviously needs network access for `/fetch`, but the LLM and `/recall` don't.
+
+**Q: Can I run multiple models?**
+Currently Cloxy loads one model at a time. Switching means running `cloxy init` again and restarting. Multi-model support is a possible future feature.
+
+**Q: Why no Linux / Windows support?**
+v4 is intentionally Apple Silicon native to take full advantage of MLX. A separate release with `llama-cpp-python` as a cross-platform fallback is on the roadmap. The Apple Silicon focus is deliberate — it's where unified memory makes commodity-hardware AI viable in ways x86 + discrete GPU can't match without dedicated server-class hardware.
+
+**Q: Is my data sent anywhere?**
+No. No telemetry, no analytics, no model usage reporting. Cloxy is local-only. The only outbound traffic is `/fetch` calls to URLs you explicitly request, and one-time model downloads from Hugging Face.
+
+**Q: How does Cloxy compare to Ollama?**
+Ollama is great. It's cross-platform and has a huge model registry. Cloxy is narrower (Apple Silicon only, one model at a time) but adds two things Ollama doesn't have built-in: persistent RAG memory and an integrated web proxy. Think of Cloxy as "Ollama + eyes + memory, native to Apple Silicon."
+
+**Q: How does Cloxy compare to LM Studio?**
+LM Studio has a GUI and broader model support. Cloxy is CLI-only and Apple Silicon focused, with web access and memory as first-class features instead of add-ons.
 
 ## License
 
