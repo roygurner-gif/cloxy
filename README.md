@@ -1,24 +1,35 @@
 # CLOXY
 
-**Give your local AI eyes and memory.**
+**Local AI with eyes and memory — native to your Mac.**
 
-Cloxy is a lightweight proxy that gives AI tools (Claude Code, local LLMs, coding assistants) unrestricted web access and persistent conversation memory — running entirely on your own hardware.
+Cloxy is a lightweight stack that gives you a local LLM plus unrestricted web access plus persistent conversation memory — all running natively on Apple Silicon. One install, one command, your hardware.
 
 ## The Problem
 
-Local LLMs and AI coding tools are smart but blind and amnesiac:
+Local LLMs are smart but blind and amnesiac:
 - **No web access** — they can't browse the internet, or hit content restrictions when they try
 - **No memory** — every conversation starts from scratch
+- **Multiple tools to set up** — pick a model runtime, pick a model, wire it to your AI tools, hope nothing breaks
 
 ## The Solution
 
-Cloxy runs on your machine and provides two things:
-1. **Web Proxy** — fetch any URL, get back clean text, markdown, or raw HTML. No content filtering, no restrictions.
-2. **Conversation Memory** — ingest past conversations into a local RAG database. Your AI can recall what you actually discussed instead of hallucinating.
+Cloxy runs on your Mac and provides:
+1. **LLM bootstrap** — `cloxy init` detects your hardware, recommends MLX-Community models that fit in unified memory, downloads your pick, and wires it in. No separate Ollama, no separate LM Studio.
+2. **OpenAI-compatible chat endpoint** — `/v1/chat/completions` works with any tool that speaks the OpenAI API (Claude Code, Continue.dev, Cursor, custom scripts).
+3. **Web Proxy** — fetch any URL, get back clean text, markdown, or raw HTML. No content filtering, no restrictions.
+4. **Conversation Memory** — ingest past conversations into a local RAG database. Your AI can recall what you actually discussed instead of hallucinating.
 
-One file. One command. Your hardware, your rules.
+One install. Your hardware. Your AI.
 
-## What's New in v3.1
+## What's New in v4.0 — Apple Silicon
+
+- **`cloxy init` wizard** — detects M-series chip + unified memory, recommends MLX models that fit, downloads your pick, persists the config.
+- **MLX backend** — native Apple Silicon inference via `mlx-lm`. Significantly faster than llama.cpp on M-series hardware because it uses the unified-memory architecture directly.
+- **`/v1/chat/completions`** — OpenAI-compatible streaming + non-streaming chat endpoint. Drop-in compatible with any tool that speaks the OpenAI API.
+- **`/v1/models`** — lists the currently-loaded model.
+- **Memory-aware recommendations** — Cloxy won't suggest a model that won't fit. Try anyway with the "Custom" option if you know your hardware; you'll get a warning before the download.
+
+## v3.1
 
 - **`/verify` endpoint** — fetch a URL and rank passages by semantic match to a claim. Cloxy returns the top-K most relevant chunks with cosine similarity scores; the calling agent reads them and decides support/contradiction. Reuses the `/fetch` clean-mode cache so follow-up fetches are free.
 
@@ -31,14 +42,42 @@ One file. One command. Your hardware, your rules.
 - **TTL cache** via cachetools — proper eviction, no hand-rolled LRU.
 - **FastAPI lifespan** — modern lifecycle management, no deprecated decorators.
 
+## Requirements
+
+- **Apple Silicon Mac** (M1, M2, M3, M4 or later) running macOS 13+
+- **Python 3.10+**
+- Enough unified memory for the model you want (see the catalog below)
+
+Cloxy is currently Apple Silicon only. Cross-platform support (Linux / Windows via `llama-cpp-python`) is on the roadmap as a separate release.
+
 ## Quick Start
 
 ```bash
 pip install -r requirements.txt
-python cloxy.py
+python cli.py init      # pick a model, download it
+python cloxy.py         # start the server
 ```
 
-Cloxy starts on `http://localhost:9055`.
+Cloxy starts on `http://localhost:9055`. The LLM is loaded on first chat request, or eagerly at boot if you set `CLOXY_EAGER_LLM=1`.
+
+### Model catalog
+
+```bash
+python cli.py list
+```
+
+Shipping with curated MLX-Community models from Phi-3 mini (2.5 GB) up through Llama 3.1 405B (220 GB, included as a tongue-in-cheek option for Studio Ultra users).
+
+### Chat with the LLM (OpenAI-compatible)
+
+```bash
+curl -X POST http://localhost:9055/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Say hi."}],
+    "max_tokens": 64
+  }'
+```
 
 ### Docker
 

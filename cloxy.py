@@ -265,18 +265,41 @@ def init_embedder():
 # LIFESPAN
 # =============================================================================
 
+async def _maybe_eager_load_llm():
+    """If CLOXY_EAGER_LLM is set and a model is configured, load it at startup."""
+    if not os.environ.get("CLOXY_EAGER_LLM"):
+        return
+    try:
+        import json
+        from pathlib import Path
+        from backends import mlx_backend
+        cfg_path = Path(os.environ.get("CLOXY_CONFIG", Path.home() / ".cloxy" / "config.json"))
+        if not cfg_path.exists():
+            logger.info("CLOXY_EAGER_LLM set but no config — run `python cli.py init` first.")
+            return
+        cfg = json.loads(cfg_path.read_text())
+        hf_id = cfg.get("model_hf_id")
+        if hf_id:
+            logger.info(f"Eagerly loading LLM: {hf_id}")
+            await mlx_backend.load_model(hf_id)
+            logger.info("LLM ready.")
+    except Exception as e:
+        logger.warning(f"Eager LLM load failed: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
     init_embedder()
     await load_vector_index()
-    logger.info(f"CLOXY v3.1 ready on port {PORT}")
+    await _maybe_eager_load_llm()
+    logger.info(f"CLOXY v4 ready on port {PORT}")
     yield
     await close_db()
     logger.info("CLOXY shut down")
 
 
-app = FastAPI(title="CLOXY", version="3.1", lifespan=lifespan)
+app = FastAPI(title="CLOXY", version="4.0", lifespan=lifespan)
 
 
 # =============================================================================
@@ -889,6 +912,117 @@ async def memory_stats():
 
 
 # =============================================================================
+# LLM CHAT (OpenAI-compatible) — Apple Silicon via MLX
+# =============================================================================
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatCompletionRequest(BaseModel):
+    model: Optional[str] = None              # ignored; we serve the loaded model
+    messages: List[ChatMessage]
+    max_tokens: int = 512
+    temperature: float = 0.7
+    top_p: float = 0.95
+    stream: bool = False
+
+
+async def _ensure_llm_loaded():
+    """Lazy-load the LLM the first time a chat request comes in."""
+    from backends import mlx_backend
+    if mlx_backend.is_loaded():
+        return
+    import json
+    from pathlib import Path
+    cfg_path = Path(os.environ.get("CLOXY_CONFIG", Path.home() / ".cloxy" / "config.json"))
+    if not cfg_path.exists():
+        raise HTTPException(
+            status_code=503,
+            detail="No LLM configured. Run `python cli.py init` to pick a model.",
+        )
+    cfg = json.loads(cfg_path.read_text())
+    hf_id = cfg.get("model_hf_id")
+    if not hf_id:
+        raise HTTPException(status_code=503, detail="Config has no model_hf_id.")
+    await mlx_backend.load_model(hf_id)
+
+
+@app.get("/v1/models", dependencies=[Depends(check_auth)])
+async def list_models():
+    """OpenAI-compatible model list. Returns the single currently-loaded model."""
+    from backends import mlx_backend
+    current = mlx_backend.current_model()
+    if not current:
+        return {"object": "list", "data": []}
+    return {
+        "object": "list",
+        "data": [{
+            "id": current,
+            "object": "model",
+            "created": int(START_TIME),
+            "owned_by": "cloxy-mlx",
+        }],
+    }
+
+
+@app.post("/v1/chat/completions", dependencies=[Depends(check_auth)])
+async def chat_completions(req: ChatCompletionRequest):
+    """OpenAI-compatible chat completions endpoint, MLX-backed."""
+    await _ensure_llm_loaded()
+    from backends import mlx_backend
+    messages = [m.model_dump() for m in req.messages]
+
+    if not req.stream:
+        return await mlx_backend.generate_chat(
+            messages=messages,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+        )
+
+    # Streaming: Server-Sent Events in OpenAI format.
+    from fastapi.responses import StreamingResponse
+
+    async def event_stream():
+        completion_id = f"cloxy-{int(time.time() * 1000)}"
+        model_id = mlx_backend.current_model() or "unknown"
+
+        async for fragment in mlx_backend.stream_chat(
+            messages=messages,
+            max_tokens=req.max_tokens,
+            temperature=req.temperature,
+            top_p=req.top_p,
+        ):
+            chunk = {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model_id,
+                "choices": [{
+                    "index": 0,
+                    "delta": {"content": fragment},
+                    "finish_reason": None,
+                }],
+            }
+            yield f"data: {json.dumps(chunk)}\n\n"
+
+        # Final chunk + DONE sentinel
+        final = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": model_id,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+        yield f"data: {json.dumps(final)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
@@ -902,7 +1036,7 @@ if __name__ == "__main__":
  | |____| |__| |__| / /\\ \\  | |
   \\_____|_____\\____/_/  \\_\\ |_|
 
-  Give your local AI eyes and memory.
-  v3.1 — numpy vector index · aiosqlite · async
+  Local AI with eyes and memory — native to your Mac.
+  v4.0 — MLX bootstrap · OpenAI-compatible /v1/chat/completions
 """)
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")

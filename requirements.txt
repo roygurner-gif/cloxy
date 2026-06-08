@@ -1,10 +1,13 @@
-fastapi>=0.100.0
-uvicorn>=0.20.0
-httpx>=0.24.0
-trafilatura>=1.6.0
-markdownify>=0.11.0
-beautifulsoup4>=4.12.0
-fastembed>=0.2.0
-numpy>=1.24.0
-aiosqlite>=0.19.0
-cachetools>=5.3.0
+fastapi>=0.136.0
+uvicorn>=0.49.0
+httpx>=0.28.0
+trafilatura>=2.1.0
+markdownify>=1.2.0
+beautifulsoup4>=4.15.0
+fastembed>=0.8.0
+numpy>=2.4.0
+aiosqlite>=0.22.0
+cachetools>=7.1.0
+
+# Apple Silicon LLM backend (mlx-lm pulls mlx as a dependency)
+mlx-lm>=0.31.0
