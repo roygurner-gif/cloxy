@@ -29,6 +29,16 @@ One install. Your hardware. Your AI.
 - **`/v1/models`** — lists the currently-loaded model.
 - **Memory-aware recommendations** — Cloxy won't suggest a model that won't fit. Try anyway with the "Custom" option if you know your hardware; you'll get a warning before the download.
 
+### v4.0 hardening
+
+- **Loopback-only by default** — the server binds `127.0.0.1`. Set `CLOXY_HOST=0.0.0.0` to expose it on your network (do that only behind `CLOXY_API_KEY` — see [Security](#security)).
+- **SSRF guard** — the web proxy refuses to fetch private / loopback / link-local addresses (e.g. `169.254.169.254` cloud metadata, `localhost`, RFC1918) unless you opt in with `CLOXY_ALLOW_PRIVATE_URLS=1`.
+- **Non-blocking embeddings** — embedding now runs off the event loop, so one `/recall` or ingest can't stall every other request.
+- **Race-safe, faster ingest** — batched dedupe + upsert-on-conflict (no read-then-write race); the vector index appends in O(1) instead of rebuilding on every insert.
+- **Forget + reindex** — delete a memory (`DELETE /memory/{id}`), drop a whole source (`/forget`), or rebuild the index from the DB (`/reindex`).
+- **Embedding-model safety** — the embed model + dim are recorded in the DB; Cloxy refuses to start against data built with a different embedder instead of silently corrupting search.
+- **Tests + CI** — a pytest suite (chunking, hashing, vector index, SSRF guard, dedupe) runs on GitHub Actions.
+
 ## v3.1
 
 - **`/verify` endpoint** — fetch a URL and rank passages by semantic match to a claim. Cloxy returns the top-K most relevant chunks with cosine similarity scores; the calling agent reads them and decides support/contradiction. Reuses the `/fetch` clean-mode cache so follow-up fetches are free.
@@ -48,7 +58,7 @@ One install. Your hardware. Your AI.
 - **Python 3.10+**
 - Enough unified memory for the model you want (see the catalog below)
 
-Cloxy is currently Apple Silicon only. Cross-platform support (Linux / Windows via `llama-cpp-python`) is on the roadmap as a separate release.
+The **local LLM** is currently Apple Silicon only. The **web proxy + RAG memory** run anywhere Python does — install `requirements-core.txt` and use Cloxy as a proxy/memory backend for an external LLM. Cross-platform local inference (Linux / Windows via `llama-cpp-python`) is on the roadmap as a separate release.
 
 ## Quick Start
 
@@ -58,7 +68,21 @@ python cli.py init      # pick a model, download it
 python cloxy.py         # start the server
 ```
 
-Cloxy starts on `http://localhost:9055`. The LLM is loaded on first chat request, or eagerly at boot if you set `CLOXY_EAGER_LLM=1`.
+Cloxy starts on `http://127.0.0.1:9055`. The LLM is loaded on first chat request, or eagerly at boot if you set `CLOXY_EAGER_LLM=1`.
+
+**Proxy + RAG only (any OS, no local LLM):** the MLX backend is Apple Silicon only. To run just the web proxy and memory (e.g. on Linux, or as a backend for an external LLM), install the core deps and skip `mlx-lm`:
+
+```bash
+pip install -r requirements-core.txt
+python cloxy.py
+```
+
+### Running the tests
+
+```bash
+pip install -r requirements-core.txt pytest
+pytest -q
+```
 
 ### Model catalog
 
@@ -274,6 +298,9 @@ curl http://localhost:9055/memory_stats
 | `POST` | `/ingest_convos` | Parse Claude Code conversations into memory |
 | `POST` | `/ingest_text` | Store any text into memory |
 | `POST` | `/recall` | Semantic search over memory (numpy vector index) |
+| `DELETE` | `/memory/{id}` | Delete a single memory by id (keeps the index in sync) |
+| `POST` | `/forget` | Delete memories by source prefix (e.g. `convo:` or a session id) |
+| `POST` | `/reindex` | Rebuild the vector index from the database |
 | `GET` | `/memory_stats` | Memory database stats |
 | `GET` | `/health` | Health check |
 | `GET` | `/` | Service info |
@@ -294,13 +321,26 @@ All config via environment variables:
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `CLOXY_PORT` | `9055` | Server port |
+| `CLOXY_HOST` | `127.0.0.1` | Bind address. Set `0.0.0.0` to expose on the network (use with `CLOXY_API_KEY`) |
 | `CLOXY_DATA_DIR` | `~/.cloxy` | Database and data directory |
 | `CLOXY_API_KEY` | *(none)* | API key for auth (empty = open) |
 | `CLOXY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model for memory |
+| `CLOXY_EMBED_DIM` | `384` | Embedding dimension (must match the model; recorded in the DB) |
+| `CLOXY_ALLOW_PRIVATE_URLS` | *(unset)* | If `1`, let the proxy fetch private/loopback addresses (SSRF risk) |
 | `CLOXY_USER_AGENT` | Chrome UA | User agent for web requests |
 | `CLOXY_FETCH_TIMEOUT` | `30` | Web fetch timeout in seconds |
 | `CLOXY_CONFIG` | `~/.cloxy/config.json` | LLM config file written by `cli.py init` |
 | `CLOXY_EAGER_LLM` | *(unset)* | If `1`, load the LLM at server startup instead of on first request |
+
+## Security
+
+Cloxy is built to run locally, and the defaults reflect that:
+
+- **Binds `127.0.0.1` by default.** Nothing is reachable off your machine unless you set `CLOXY_HOST=0.0.0.0`.
+- **If you expose it, set an API key.** `CLOXY_HOST=0.0.0.0` with no `CLOXY_API_KEY` means anyone on your network can use your proxy, read/write your memory, and drive your LLM. Cloxy prints a warning at startup in that configuration. The key is checked with a constant-time compare.
+- **SSRF guard on the proxy.** `/fetch`, `/search`, and `/verify` resolve the target host and refuse private, loopback, link-local, and cloud-metadata addresses. This stops an exposed instance from being used to pivot into internal services. Opt out for local scraping with `CLOXY_ALLOW_PRIVATE_URLS=1`.
+
+> The Docker image sets `CLOXY_HOST=0.0.0.0` because a container needs it for the mapped port to work — so **set `CLOXY_API_KEY` when running under Docker.**
 
 ## How It Works
 

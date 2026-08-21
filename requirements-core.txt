@@ -1,0 +1,11 @@
+# Core server: web proxy + RAG. Installs on any platform (Linux CI included).
+fastapi>=0.136.0
+uvicorn>=0.49.0
+httpx>=0.28.0
+trafilatura>=2.1.0
+markdownify>=1.2.0
+beautifulsoup4>=4.15.0
+fastembed>=0.8.0
+numpy>=2.4.0
+aiosqlite>=0.22.0
+cachetools>=7.1.0

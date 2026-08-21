@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from hardware import detect, NotAppleSiliconError
-from models import CATALOG, Model, by_short_name, fits, recommend
+from models import CATALOG, Model, fits, recommend
 
 
 CONFIG_PATH = Path(os.environ.get("CLOXY_CONFIG", Path.home() / ".cloxy" / "config.json"))
