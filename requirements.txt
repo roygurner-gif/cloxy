@@ -1,13 +1,7 @@
-fastapi>=0.136.0
-uvicorn>=0.49.0
-httpx>=0.28.0
-trafilatura>=2.1.0
-markdownify>=1.2.0
-beautifulsoup4>=4.15.0
-fastembed>=0.8.0
-numpy>=2.4.0
-aiosqlite>=0.22.0
-cachetools>=7.1.0
+# Full install (Apple Silicon): core server + the MLX LLM backend.
+-r requirements-core.txt
 
-# Apple Silicon LLM backend (mlx-lm pulls mlx as a dependency)
+# Apple Silicon LLM backend (mlx-lm pulls mlx as a dependency).
+# Apple Silicon only — on Linux/Windows install requirements-core.txt instead
+# and run Cloxy as a proxy + RAG service without the local LLM.
 mlx-lm>=0.31.0

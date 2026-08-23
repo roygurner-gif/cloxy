@@ -5,3 +5,4 @@ __pycache__/
 .cloxy/
 venv/
 .venv/
+.pytest_cache/

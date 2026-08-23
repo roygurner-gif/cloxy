@@ -12,7 +12,12 @@ services:
       - CLOXY_PORT=9055
       - CLOXY_DATA_DIR=/data
       - CLOXY_EMBED_MODEL=BAAI/bge-small-en-v1.5
+      # In a container the app must bind 0.0.0.0 for the mapped port to work.
+      # Because this is network-exposed, SET AN API KEY below.
+      - CLOXY_HOST=0.0.0.0
       # - CLOXY_API_KEY=your-secret-key
+      # Uncomment to let the proxy reach private/LAN addresses (SSRF risk):
+      # - CLOXY_ALLOW_PRIVATE_URLS=1
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9055/health"]

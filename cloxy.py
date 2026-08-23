@@ -3,18 +3,17 @@
 CLOXY — Give your local AI eyes and memory.
 Web proxy + conversation RAG for local LLMs and AI coding tools.
 
-v3.1 — Adds:
-  - /verify endpoint: rank URL passages by semantic match to a claim
-  - Reuses /fetch clean-mode cache (no double-fetch on follow-up)
+v4.0 — Adds:
+  - Apple Silicon LLM bootstrap + OpenAI-compatible /v1/chat/completions (MLX)
+  - Embedding runs off the event loop (non-blocking under concurrency)
+  - Upsert-on-conflict ingest (no read-then-write race)
+  - Delete / prune endpoints + index rebuild
+  - SSRF guard on the web proxy; loopback-only bind by default
+  - Embed-model/dim recorded in DB and enforced on startup
 
-v3.0 — Rebuilt with:
-  - Numpy matrix vector search (batch cosine sim, no Python loops)
-  - aiosqlite for async-safe database access
-  - SHA256 content hashing
-  - FastAPI lifespan (no deprecated on_event)
-  - Optional API key auth
-  - TTL cache via cachetools
-  - In-memory vector index with auto-reload from DB
+v3.1 — /verify endpoint: rank URL passages by semantic match to a claim.
+v3.0 — numpy vector search, aiosqlite, SHA256 hashing, FastAPI lifespan,
+       optional API key auth, TTL cache, in-memory vector index.
 
 Usage:
     pip install fastapi uvicorn httpx trafilatura markdownify beautifulsoup4 \
@@ -43,6 +42,10 @@ import json
 import re
 import glob as globmod
 import struct
+import socket
+import ipaddress
+import secrets
+import asyncio
 import logging
 import threading
 from contextlib import asynccontextmanager
@@ -64,8 +67,14 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel
 from cachetools import TTLCache
 
+# --- Version (single source of truth) ---
+__version__ = "4.0"
+
 # --- Config ---
 PORT = int(os.environ.get("CLOXY_PORT", 9055))
+# Bind loopback-only by default. Set CLOXY_HOST=0.0.0.0 to expose on the network
+# (do that only behind CLOXY_API_KEY — see the SSRF note in README).
+HOST = os.environ.get("CLOXY_HOST", "127.0.0.1")
 DATA_DIR = os.environ.get("CLOXY_DATA_DIR", os.path.expanduser("~/.cloxy"))
 DB_PATH = os.path.join(DATA_DIR, "memory.db")
 API_KEY = os.environ.get("CLOXY_API_KEY", "")  # empty = no auth
@@ -74,10 +83,14 @@ USER_AGENT = os.environ.get("CLOXY_USER_AGENT",
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 FETCH_TIMEOUT = float(os.environ.get("CLOXY_FETCH_TIMEOUT", 30))
 MAX_CONTENT_LENGTH = 500_000
+# Allow the proxy to reach private/loopback/link-local addresses. Off by default
+# so an exposed instance can't be used to pivot into internal services / cloud
+# metadata (169.254.169.254). Set CLOXY_ALLOW_PRIVATE_URLS=1 for local scraping.
+ALLOW_PRIVATE_URLS = os.environ.get("CLOXY_ALLOW_PRIVATE_URLS", "") not in ("", "0", "false", "False")
 
 # --- RAG Config ---
 EMBED_MODEL = os.environ.get("CLOXY_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
-EMBED_DIM = 384
+EMBED_DIM = int(os.environ.get("CLOXY_EMBED_DIM", 384))
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
 
@@ -103,52 +116,69 @@ class VectorIndex:
     In-memory vector index backed by a normalized numpy matrix.
     Recall is a single matrix multiply — no Python loops, no full table scan.
     Auto-syncs with SQLite on insert and startup.
+
+    Vectors are appended to a Python list and the packed matrix is rebuilt
+    lazily on the next search (dirty flag). This keeps inserts O(1) amortized
+    instead of O(N) per add — a large ingest was previously O(N^2) because each
+    add did a full np.vstack of the whole matrix.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._ids: List[int] = []
-        self._matrix: Optional[np.ndarray] = None  # (N, dim) normalized
+        self._vecs: List[np.ndarray] = []   # normalized (dim,) rows, append-only
+        self._matrix: Optional[np.ndarray] = None  # (N, dim) rebuilt from _vecs
+        self._dirty = False
+
+    @staticmethod
+    def _normalize(embedding: np.ndarray) -> np.ndarray:
+        vec = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
+        return vec
 
     def load(self, ids: List[int], embeddings: List[np.ndarray]):
-        """Bulk load from database on startup."""
+        """Bulk (re)load from database. Replaces any existing contents."""
         with self._lock:
-            if not ids:
-                self._ids = []
-                self._matrix = None
-                return
             self._ids = list(ids)
-            mat = np.vstack(embeddings).astype(np.float32)
-            # Normalize rows for cosine similarity via dot product
-            norms = np.linalg.norm(mat, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            self._matrix = mat / norms
+            self._vecs = [self._normalize(e) for e in embeddings]
+            self._matrix = None
+            self._dirty = True
 
     def add(self, chunk_id: int, embedding: np.ndarray):
-        """Add a single vector to the index."""
+        """Add a single vector to the index (O(1) amortized)."""
         with self._lock:
-            vec = embedding.astype(np.float32).reshape(1, -1)
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vec = vec / norm
             self._ids.append(chunk_id)
-            if self._matrix is None:
-                self._matrix = vec
-            else:
-                self._matrix = np.vstack([self._matrix, vec])
+            self._vecs.append(self._normalize(embedding))
+            self._dirty = True
 
     def add_batch(self, ids: List[int], embeddings: List[np.ndarray]):
         """Add multiple vectors at once."""
         with self._lock:
-            mat = np.vstack(embeddings).astype(np.float32)
-            norms = np.linalg.norm(mat, axis=1, keepdims=True)
-            norms[norms == 0] = 1.0
-            mat = mat / norms
             self._ids.extend(ids)
-            if self._matrix is None:
-                self._matrix = mat
-            else:
-                self._matrix = np.vstack([self._matrix, mat])
+            self._vecs.extend(self._normalize(e) for e in embeddings)
+            self._dirty = True
+
+    def remove(self, chunk_ids) -> int:
+        """Drop the given chunk ids from the index. Returns count removed."""
+        drop = set(chunk_ids)
+        with self._lock:
+            keep = [(i, v) for i, v in zip(self._ids, self._vecs) if i not in drop]
+            removed = len(self._ids) - len(keep)
+            self._ids = [i for i, _ in keep]
+            self._vecs = [v for _, v in keep]
+            self._matrix = None
+            self._dirty = True
+            return removed
+
+    def _rebuild_locked(self):
+        """Rebuild the packed matrix from _vecs. Caller must hold the lock."""
+        if not self._vecs:
+            self._matrix = None
+        else:
+            self._matrix = np.vstack(self._vecs).astype(np.float32)
+        self._dirty = False
 
     def search(self, query_embedding: np.ndarray, top_k: int = 5) -> List[tuple]:
         """
@@ -156,12 +186,11 @@ class VectorIndex:
         Single matrix multiply — O(N) but vectorized in C, not Python.
         """
         with self._lock:
+            if self._dirty or self._matrix is None:
+                self._rebuild_locked()
             if self._matrix is None or len(self._ids) == 0:
                 return []
-            q = query_embedding.astype(np.float32).reshape(1, -1)
-            norm = np.linalg.norm(q)
-            if norm > 0:
-                q = q / norm
+            q = self._normalize(query_embedding).reshape(1, -1)
             # Cosine similarity via dot product (both sides normalized)
             scores = (self._matrix @ q.T).flatten()
             k = min(top_k, len(scores))
@@ -187,7 +216,7 @@ _api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 async def check_auth(api_key: Optional[str] = Depends(_api_key_header)):
     """Optional API key auth. Skipped if CLOXY_API_KEY is not set."""
-    if API_KEY and api_key != API_KEY:
+    if API_KEY and not (api_key and secrets.compare_digest(api_key, API_KEY)):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
@@ -219,8 +248,50 @@ async def init_db():
         )
     """)
     await _db_pool.execute("CREATE INDEX IF NOT EXISTS idx_hash ON chunks(content_hash)")
+    await _db_pool.execute("CREATE INDEX IF NOT EXISTS idx_source ON chunks(source)")
+    await _db_pool.execute("""
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     await _db_pool.commit()
+    await _check_embed_meta()
     logger.info(f"Database ready at {DB_PATH}")
+
+
+async def _check_embed_meta():
+    """
+    Record the embedding model + dim in the DB the first time, and refuse to
+    start if a later run points at a different model/dim than the stored data.
+    Mixing dims silently corrupts vector search (np.vstack would blow up, or
+    worse, compare incompatible spaces).
+    """
+    db = _db_pool
+    rows = {r[0]: r[1] for r in await db.execute_fetchall("SELECT key, value FROM meta")}
+    stored_model = rows.get("embed_model")
+    stored_dim = rows.get("embed_dim")
+
+    has_data = (await db.execute_fetchall("SELECT 1 FROM chunks LIMIT 1")) != []
+
+    if stored_model is None:
+        if has_data:
+            # Pre-v4 DB with no meta — trust current config but warn.
+            logger.warning("No embed metadata in DB; assuming current model. "
+                           "If recall looks wrong, re-ingest with a clean DB.")
+        await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                         ("embed_model", EMBED_MODEL))
+        await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
+                         ("embed_dim", str(EMBED_DIM)))
+        await db.commit()
+        return
+
+    if stored_model != EMBED_MODEL or stored_dim != str(EMBED_DIM):
+        raise RuntimeError(
+            f"Embedding mismatch: DB was built with {stored_model} (dim {stored_dim}) "
+            f"but CLOXY_EMBED_MODEL={EMBED_MODEL} (dim {EMBED_DIM}). "
+            f"Use the original model, or start with a fresh CLOXY_DATA_DIR."
+        )
 
 
 async def load_vector_index():
@@ -230,6 +301,7 @@ async def load_vector_index():
         "SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL"
     )
     if not rows:
+        vec_index.load([], [])  # clear any stale contents
         logger.info("Vector index: empty (no embeddings in DB)")
         return
 
@@ -293,13 +365,13 @@ async def lifespan(app: FastAPI):
     init_embedder()
     await load_vector_index()
     await _maybe_eager_load_llm()
-    logger.info(f"CLOXY v4 ready on port {PORT}")
+    logger.info(f"CLOXY v{__version__} ready on {HOST}:{PORT}")
     yield
     await close_db()
     logger.info("CLOXY shut down")
 
 
-app = FastAPI(title="CLOXY", version="4.0", lifespan=lifespan)
+app = FastAPI(title="CLOXY", version=__version__, lifespan=lifespan)
 
 
 # =============================================================================
@@ -312,6 +384,16 @@ def embed_text(text: str) -> np.ndarray:
 
 def embed_batch(texts: List[str]) -> List[np.ndarray]:
     return list(embedder.embed(texts))
+
+
+async def aembed_text(text: str) -> np.ndarray:
+    """Embed a single string off the event loop (fastembed is sync + CPU-bound)."""
+    return await asyncio.to_thread(embed_text, text)
+
+
+async def aembed_batch(texts: List[str]) -> List[np.ndarray]:
+    """Embed a batch off the event loop so one request can't stall the server."""
+    return await asyncio.to_thread(embed_batch, texts)
 
 
 def pack_embedding(vec: np.ndarray) -> bytes:
@@ -413,8 +495,76 @@ def content_hash(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+async def existing_hashes(db, hashes: List[str]) -> set:
+    """
+    Return the subset of `hashes` already present in the chunks table, using
+    batched IN queries (respecting SQLite's bound-variable limit) instead of
+    one SELECT per chunk.
+    """
+    found = set()
+    BATCH = 500
+    for i in range(0, len(hashes), BATCH):
+        window = hashes[i:i + BATCH]
+        placeholders = ",".join("?" * len(window))
+        rows = await db.execute_fetchall(
+            f"SELECT content_hash FROM chunks WHERE content_hash IN ({placeholders})",
+            window,
+        )
+        found.update(r[0] for r in rows)
+    return found
+
+
 def cache_key(url: str, mode: str) -> str:
     return hashlib.sha256(f"{url}:{mode}".encode()).hexdigest()
+
+
+# =============================================================================
+# SSRF GUARD
+# =============================================================================
+
+def _ip_is_blocked(ip: str) -> bool:
+    """Block loopback, private, link-local, and other non-global ranges."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True  # unparseable — refuse
+    return (
+        addr.is_private or addr.is_loopback or addr.is_link_local
+        or addr.is_multicast or addr.is_reserved or addr.is_unspecified
+    )
+
+
+def validate_fetch_url(url: str) -> Optional[str]:
+    """
+    Return None if the URL is safe to fetch, else a human-readable reason.
+
+    Guards the server-side proxy against SSRF: rejects non-http(s) schemes and
+    (unless CLOXY_ALLOW_PRIVATE_URLS is set) any host that resolves to a
+    private / loopback / link-local address — e.g. 169.254.169.254 cloud
+    metadata, localhost, or RFC1918 internal services.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return "URL must be http or https"
+
+    host = parsed.hostname
+    if not host:
+        return "URL has no host"
+
+    if ALLOW_PRIVATE_URLS:
+        return None
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return f"Could not resolve host: {host}"
+
+    for info in infos:
+        ip = info[4][0]
+        if _ip_is_blocked(ip):
+            return (f"Refusing to fetch private/loopback address ({host} -> {ip}). "
+                    f"Set CLOXY_ALLOW_PRIVATE_URLS=1 to allow.")
+    return None
 
 
 # =============================================================================
@@ -455,6 +605,10 @@ class VerifyRequest(BaseModel):
     top_k: int = 3
 
 
+class DeleteBySourceRequest(BaseModel):
+    source_prefix: str  # matches source LIKE 'prefix%' (e.g. "convo:" or "manual")
+
+
 # =============================================================================
 # ENDPOINTS — WEB PROXY
 # =============================================================================
@@ -475,7 +629,7 @@ async def index():
   \\_____|_____\\____/_/  \\_\\ |_|
 
   Give your local AI eyes and memory.
-  v3.1 — Port {PORT} — {doc_count} memories — Auth {auth_status}
+  v{__version__} — Port {PORT} — {doc_count} memories — Auth {auth_status}
 
   WEB PROXY:
     POST /fetch          — Fetch and clean a URL
@@ -487,6 +641,13 @@ async def index():
     POST /ingest_text    — Store any text into memory
     POST /recall         — Search conversation memory (vector index)
     GET  /memory_stats   — Memory stats
+    DELETE /memory/{{id}}  — Delete one memory
+    POST /forget         — Delete memories by source prefix
+    POST /reindex        — Rebuild the vector index from the DB
+
+  LLM (OpenAI-compatible, MLX):
+    POST /v1/chat/completions — Chat (streaming or not)
+    GET  /v1/models      — The currently-loaded model
 
   HEALTH:
     GET  /health         — Health check
@@ -503,7 +664,7 @@ async def health():
     return {
         "status": "OK",
         "service": "cloxy",
-        "version": "3.1",
+        "version": __version__,
         "uptime": round(time.time() - START_TIME),
         "cache_size": _cache.currsize,
         "memories": doc_count,
@@ -518,9 +679,9 @@ async def health():
 async def fetch(req: FetchRequest):
     logger.info(f"FETCH url={req.url} mode={req.mode}")
 
-    parsed = urlparse(req.url)
-    if parsed.scheme not in ("http", "https"):
-        return JSONResponse(status_code=400, content={"error": "URL must be http or https"})
+    blocked = validate_fetch_url(req.url)
+    if blocked:
+        return JSONResponse(status_code=400, content={"error": blocked})
 
     ckey = cache_key(req.url, req.mode)
     cached = _cache.get(ckey)
@@ -591,6 +752,10 @@ async def fetch(req: FetchRequest):
 async def search_extract(req: SearchExtract):
     logger.info(f"SEARCH url={req.url} pattern={req.pattern}")
 
+    blocked = validate_fetch_url(req.url)
+    if blocked:
+        return JSONResponse(status_code=400, content={"error": blocked})
+
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=FETCH_TIMEOUT) as client:
             resp = await client.get(req.url, headers={"User-Agent": USER_AGENT})
@@ -633,9 +798,9 @@ async def verify(req: VerifyRequest):
     """
     logger.info(f"VERIFY url={req.url} claim='{req.claim[:80]}'")
 
-    parsed = urlparse(req.url)
-    if parsed.scheme not in ("http", "https"):
-        return JSONResponse(status_code=400, content={"error": "URL must be http or https"})
+    blocked = validate_fetch_url(req.url)
+    if blocked:
+        return JSONResponse(status_code=400, content={"error": blocked})
 
     # Reuse /fetch clean-mode cache if present
     ckey = cache_key(req.url, "clean")
@@ -702,7 +867,7 @@ async def verify(req: VerifyRequest):
         }
 
     # Batch-embed all chunks plus the claim, then cosine similarity
-    all_embs = embed_batch(chunks + [req.claim])
+    all_embs = await aembed_batch(chunks + [req.claim])
     chunk_embs = all_embs[:-1]
     claim_emb = all_embs[-1]
 
@@ -779,33 +944,47 @@ async def ingest_convos(req: IngestConvoRequest):
             chunks = chunk_conversation(messages, session_id)
             total_chunks += len(chunks)
 
-            new_chunks = []
+            # De-dupe within the file, then drop hashes already in the DB in one
+            # batched query — so we never embed content we're going to discard.
+            seen = set()
+            candidates = []
             for chunk in chunks:
                 h = content_hash(chunk["text"])
-                row = await db.execute("SELECT 1 FROM chunks WHERE content_hash = ?", (h,))
-                exists = await row.fetchone()
-                if not exists:
-                    new_chunks.append((chunk["text"], h, chunk["source"]))
-                else:
+                if h in seen:
                     total_dupes += 1
+                    continue
+                seen.add(h)
+                candidates.append((chunk["text"], h, chunk["source"]))
+
+            already = await existing_hashes(db, [c[1] for c in candidates])
+            new_chunks = [c for c in candidates if c[1] not in already]
+            total_dupes += len(candidates) - len(new_chunks)
 
             if new_chunks:
                 texts = [c[0] for c in new_chunks]
-                embeddings = embed_batch(texts)
+                embeddings = await aembed_batch(texts)
 
-                new_ids = []
+                new_ids, new_embs = [], []
                 for (text, h, source), emb in zip(new_chunks, embeddings):
+                    # ON CONFLICT is the race-safe backstop: a concurrent ingest
+                    # of the same content just yields no row instead of raising.
                     cursor = await db.execute(
-                        "INSERT INTO chunks (content, content_hash, source, embedding) VALUES (?, ?, ?, ?)",
+                        "INSERT INTO chunks (content, content_hash, source, embedding) "
+                        "VALUES (?, ?, ?, ?) ON CONFLICT(content_hash) DO NOTHING RETURNING id",
                         (text, h, source, pack_embedding(emb))
                     )
-                    new_ids.append(cursor.lastrowid)
+                    row = await cursor.fetchone()
+                    if row is None:
+                        total_dupes += 1
+                    else:
+                        new_ids.append(row[0])
+                        new_embs.append(emb)
 
                 await db.commit()
 
-                # Update in-memory vector index
-                vec_index.add_batch(new_ids, embeddings)
-                total_stored += len(new_chunks)
+                if new_ids:
+                    vec_index.add_batch(new_ids, new_embs)
+                    total_stored += len(new_ids)
 
             processed_files += 1
 
@@ -829,22 +1008,39 @@ async def ingest_text(req: IngestTextRequest):
 
     db = await get_db()
     chunks = chunk_text(req.text)
-    stored = 0
 
+    # De-dupe within the payload and against the DB before embedding.
+    seen = set()
+    candidates = []
     for i, chunk in enumerate(chunks):
         h = content_hash(chunk)
-        row = await db.execute("SELECT 1 FROM chunks WHERE content_hash = ?", (h,))
-        exists = await row.fetchone()
-        if not exists:
-            emb = embed_text(chunk)
-            cursor = await db.execute(
-                "INSERT INTO chunks (content, content_hash, source, embedding) VALUES (?, ?, ?, ?)",
-                (chunk, h, f"{req.source}:chunk{i}", pack_embedding(emb))
-            )
-            vec_index.add(cursor.lastrowid, emb)
-            stored += 1
+        if h in seen:
+            continue
+        seen.add(h)
+        candidates.append((chunk, h, f"{req.source}:chunk{i}"))
 
-    await db.commit()
+    already = await existing_hashes(db, [c[1] for c in candidates])
+    new_chunks = [c for c in candidates if c[1] not in already]
+
+    stored = 0
+    if new_chunks:
+        embeddings = await aembed_batch([c[0] for c in new_chunks])
+        new_ids, new_embs = [], []
+        for (chunk, h, source), emb in zip(new_chunks, embeddings):
+            cursor = await db.execute(
+                "INSERT INTO chunks (content, content_hash, source, embedding) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(content_hash) DO NOTHING RETURNING id",
+                (chunk, h, source, pack_embedding(emb))
+            )
+            row = await cursor.fetchone()
+            if row is not None:
+                new_ids.append(row[0])
+                new_embs.append(emb)
+        await db.commit()
+        if new_ids:
+            vec_index.add_batch(new_ids, new_embs)
+            stored = len(new_ids)
+
     return {"chunks_stored": stored, "total_chunks": len(chunks)}
 
 
@@ -853,7 +1049,7 @@ async def recall(req: RecallRequest):
     """Semantic search via in-memory numpy vector index."""
     logger.info(f"RECALL query='{req.query[:80]}' top_k={req.top_k}")
 
-    query_emb = embed_text(req.query)
+    query_emb = await aembed_text(req.query)
 
     # Single matrix multiply — no Python loop, no table scan
     results_raw = vec_index.search(query_emb, top_k=req.top_k)
@@ -909,6 +1105,49 @@ async def memory_stats():
         "db_path": DB_PATH,
         "vector_engine": "numpy_matrix",
     }
+
+
+@app.delete("/memory/{chunk_id}", dependencies=[Depends(check_auth)])
+async def delete_memory(chunk_id: int):
+    """Delete a single memory by id, keeping the vector index in sync."""
+    db = await get_db()
+    cursor = await db.execute("DELETE FROM chunks WHERE id = ? RETURNING id", (chunk_id,))
+    row = await cursor.fetchone()
+    await db.commit()
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": f"No memory with id {chunk_id}"})
+    removed = vec_index.remove([chunk_id])
+    return {"deleted": chunk_id, "index_removed": removed}
+
+
+@app.post("/forget", dependencies=[Depends(check_auth)])
+async def forget(req: DeleteBySourceRequest):
+    """
+    Delete every memory whose source starts with `source_prefix`
+    (e.g. "convo:" to drop all ingested conversations, or a single session id).
+    Keeps the in-memory vector index consistent with the DB.
+    """
+    logger.info(f"FORGET source_prefix={req.source_prefix!r}")
+    db = await get_db()
+    like = req.source_prefix.replace("%", r"\%").replace("_", r"\_") + "%"
+    cursor = await db.execute(
+        "DELETE FROM chunks WHERE source LIKE ? ESCAPE '\\' RETURNING id", (like,)
+    )
+    rows = await cursor.fetchall()
+    await db.commit()
+    ids = [r[0] for r in rows]
+    removed = vec_index.remove(ids) if ids else 0
+    return {"deleted": len(ids), "index_removed": removed, "source_prefix": req.source_prefix}
+
+
+@app.post("/reindex", dependencies=[Depends(check_auth)])
+async def reindex():
+    """
+    Rebuild the in-memory vector index from the database. Use after manual DB
+    edits, or if you ever suspect the index and DB have drifted.
+    """
+    await load_vector_index()
+    return {"status": "rebuilt", "vector_index_size": vec_index.size}
 
 
 # =============================================================================
@@ -1026,8 +1265,34 @@ async def chat_completions(req: ChatCompletionRequest):
 # MAIN
 # =============================================================================
 
+def _preflight_embed_check():
+    """
+    Synchronous embed-model/dim check before uvicorn starts, so a mismatch
+    exits the process cleanly with a clear message instead of failing inside
+    the async lifespan (where uvicorn can linger).
+    """
+    import sqlite3
+    if not os.path.exists(DB_PATH):
+        return
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        rows = {k: v for k, v in conn.execute("SELECT key, value FROM meta").fetchall()}
+        conn.close()
+    except sqlite3.Error:
+        return  # pre-v4 DB without a meta table; the lifespan path handles it
+    stored_model, stored_dim = rows.get("embed_model"), rows.get("embed_dim")
+    if stored_model and (stored_model != EMBED_MODEL or stored_dim != str(EMBED_DIM)):
+        sys.exit(
+            f"\nCLOXY refusing to start: embedding mismatch.\n"
+            f"  DB was built with: {stored_model} (dim {stored_dim})\n"
+            f"  You configured:    {EMBED_MODEL} (dim {EMBED_DIM})\n"
+            f"Use the original model, or start with a fresh CLOXY_DATA_DIR.\n"
+        )
+
+
 if __name__ == "__main__":
     import uvicorn
+    _preflight_embed_check()
     print("""
    _____ _     _____ __  ____   __
   / ____| |   / __ \\ \\/ /\\ \\ / /
@@ -1037,6 +1302,9 @@ if __name__ == "__main__":
   \\_____|_____\\____/_/  \\_\\ |_|
 
   Local AI with eyes and memory — native to your Mac.
-  v4.0 — MLX bootstrap · OpenAI-compatible /v1/chat/completions
-""")
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+  v{ver} — MLX bootstrap · OpenAI-compatible /v1/chat/completions
+""".format(ver=__version__))
+    if HOST == "0.0.0.0" and not API_KEY:
+        logger.warning("Binding 0.0.0.0 with NO api key — the proxy + RAG are "
+                       "open to your whole network. Set CLOXY_API_KEY.")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
