@@ -135,9 +135,20 @@ vec_index = VectorIndex()
 # EMBEDDING
 # =============================================================================
 
+def _model_cache_dir() -> str:
+    """
+    Keep downloaded models under the data dir. fastembed's default is the
+    system temp dir, which macOS purges — a 2 GB re-download on a bad day.
+    """
+    import os
+    path = os.environ.setdefault("FASTEMBED_CACHE_PATH", os.path.join(config.DATA_DIR, "models"))
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def init_embedder():
     global embedder
-    logger.info(f"Loading embedding model: {config.EMBED_MODEL}")
+    logger.info(f"Loading embedding model: {config.EMBED_MODEL} (cache {_model_cache_dir()})")
     embedder = TextEmbedding(model_name=config.EMBED_MODEL)
     logger.info("Embedding model loaded")
 
@@ -173,6 +184,7 @@ def _get_reranker():
     global reranker
     if reranker is None:
         from fastembed.rerank.cross_encoder import TextCrossEncoder
+        _model_cache_dir()
         logger.info(f"Loading reranker: {config.RERANK_MODEL}")
         reranker = TextCrossEncoder(model_name=config.RERANK_MODEL)
     return reranker

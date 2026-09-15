@@ -165,7 +165,8 @@ Everything is an environment variable.
 | `CLOXY_HOST` | `127.0.0.1` | Bind address. `0.0.0.0` exposes it on the network — set an API key |
 | `CLOXY_URL` | `http://127.0.0.1:9055` | Where the CLI and MCP server find the server |
 | `CLOXY_API_KEY` | *(none)* | API key (`X-API-Key` header). Empty = open |
-| `CLOXY_DATA_DIR` | `~/.cloxy` | Database, LLM config, logs |
+| `CLOXY_DATA_DIR` | `~/.cloxy` | Database, LLM config, logs, downloaded embedding models (`models/`) |
+| `FASTEMBED_CACHE_PATH` | `$CLOXY_DATA_DIR/models` | Where embedding/reranker models are cached (set explicitly to share an existing cache) |
 | `CLOXY_WATCH` | `1` | Run the conversation watcher |
 | `CLOXY_WATCH_DIRS` | `~/.claude/projects` | Directories to watch (`:`-separated) |
 | `CLOXY_WATCH_INTERVAL` | `5` | Seconds between scans |
