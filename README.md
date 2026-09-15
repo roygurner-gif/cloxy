@@ -15,11 +15,21 @@ Local LLMs are smart but blind and amnesiac:
 
 Cloxy runs on your Mac and provides:
 1. **LLM bootstrap** — `cloxy init` detects your hardware, recommends MLX-Community models that fit in unified memory, downloads your pick, and wires it in. No separate Ollama, no separate LM Studio.
-2. **OpenAI-compatible chat endpoint** — `/v1/chat/completions` works with any tool that speaks the OpenAI API (Claude Code, Continue.dev, Cursor, custom scripts).
+2. **OpenAI-compatible chat endpoint** — `/v1/chat/completions` works with any tool that speaks the OpenAI API (Continue.dev, Cursor, the `openai` SDK, custom scripts).
 3. **Web Proxy** — fetch any URL, get back clean text, markdown, or raw HTML. No content filtering, no restrictions.
 4. **Conversation Memory** — ingest past conversations into a local RAG database. Your AI can recall what you actually discussed instead of hallucinating.
 
 One install. Your hardware. Your AI.
+
+## What's New in v4.1 — correctness
+
+- **Redirect-safe SSRF guard** — the proxy no longer follows redirects blindly; every hop is re-checked, so a public URL can't 302 the server into `169.254.169.254` or your LAN.
+- **Streamed, capped downloads** — pages are read up to 500 KB and then cut, instead of being downloaded whole and sliced. Obvious binaries (PDF, images, archives) are refused with a 415 instead of being fed to the extractor.
+- **Fetch cache keyed correctly** — `extract` mode with different selectors (or different caller headers) no longer returns a stale cached result.
+- **One generation at a time on MLX** — chat requests are serialized on the GPU; a second request queues instead of contending. A disconnected streaming client stops generation instead of running to `max_tokens`.
+- **Better OpenAI compatibility** — `content` may be a list of parts (as Cursor / Continue / the `openai` SDK send it), `max_completion_tokens` is honored, `finish_reason` is `length` when the budget is hit, and streaming returns `usage`.
+- `/recall` fetches matched rows in one query; `top_k` is bounded; `/ingest_text` payloads are capped.
+- Endpoint test suite (fetch, redirects, cache, memory round-trip, chat request shapes) runs in CI alongside the unit tests.
 
 ## What's New in v4.0 — Apple Silicon
 
@@ -55,7 +65,7 @@ One install. Your hardware. Your AI.
 ## Requirements
 
 - **Apple Silicon Mac** (M1, M2, M3, M4 or later) running macOS 13+
-- **Python 3.10+**
+- **Python 3.11+** (numpy 2.4 floor)
 - Enough unified memory for the model you want (see the catalog below)
 
 The **local LLM** is currently Apple Silicon only. The **web proxy + RAG memory** run anywhere Python does — install `requirements-core.txt` and use Cloxy as a proxy/memory backend for an external LLM. Cross-platform local inference (Linux / Windows via `llama-cpp-python`) is on the roadmap as a separate release.
@@ -126,17 +136,7 @@ Cross-platform support (Linux via vLLM or `llama-cpp-python`, Windows via `llama
 
 Cloxy's `/v1/chat/completions` is OpenAI-compatible, so anything that speaks the OpenAI API can use it.
 
-### Claude Code
-
-Set the model endpoint in your settings:
-
-```jsonc
-{
-  "model": "cloxy",
-  "modelEndpoint": "http://localhost:9055/v1",
-  "apiKey": "not-required"  // unless you set CLOXY_API_KEY
-}
-```
+> **Claude Code** speaks the Anthropic Messages API, not the OpenAI one, so it can't use Cloxy as its model. It *can* use Cloxy's eyes and memory: point it at `/fetch`, `/recall`, and `/verify` with `curl` (an MCP server is on the roadmap).
 
 ### Continue.dev (VS Code / JetBrains)
 
@@ -338,7 +338,7 @@ Cloxy is built to run locally, and the defaults reflect that:
 
 - **Binds `127.0.0.1` by default.** Nothing is reachable off your machine unless you set `CLOXY_HOST=0.0.0.0`.
 - **If you expose it, set an API key.** `CLOXY_HOST=0.0.0.0` with no `CLOXY_API_KEY` means anyone on your network can use your proxy, read/write your memory, and drive your LLM. Cloxy prints a warning at startup in that configuration. The key is checked with a constant-time compare.
-- **SSRF guard on the proxy.** `/fetch`, `/search`, and `/verify` resolve the target host and refuse private, loopback, link-local, and cloud-metadata addresses. This stops an exposed instance from being used to pivot into internal services. Opt out for local scraping with `CLOXY_ALLOW_PRIVATE_URLS=1`.
+- **SSRF guard on the proxy.** `/fetch`, `/search`, and `/verify` resolve the target host and refuse private, loopback, link-local, and cloud-metadata addresses — and re-check every redirect hop (max 5), so a public page can't bounce the server into an internal address. This stops an exposed instance from being used to pivot into internal services. Opt out for local scraping with `CLOXY_ALLOW_PRIVATE_URLS=1`.
 
 > The Docker image sets `CLOXY_HOST=0.0.0.0` because a container needs it for the mapped port to work — so **set `CLOXY_API_KEY` when running under Docker.**
 
@@ -362,7 +362,7 @@ Everything runs locally. No external APIs. No telemetry. No cloud. The LLM, the 
 
 ## Stack
 
-- Python 3.12+ / FastAPI / uvicorn
+- Python 3.11+ / FastAPI / uvicorn
 - **MLX / mlx-lm** for LLM inference (Apple Silicon native)
 - httpx / trafilatura / BeautifulSoup / markdownify
 - fastembed (BAAI/bge-small-en-v1.5) / numpy / aiosqlite
