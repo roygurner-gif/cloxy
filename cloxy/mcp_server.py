@@ -75,6 +75,8 @@ async def recall(query: str, top_k: int = 5, project: Optional[str] = None,
     date and project. `project` is a substring of the project directory
     (e.g. "cloxy"); `since`/`until` are ISO dates like "2026-09-01".
     `mode` is "hybrid" (default), "dense" (meaning only) or "keyword" (exact terms).
+    `score` is a reciprocal-rank-fusion value (typically 0.01–0.04): only the
+    order within one result set is meaningful, not the absolute number.
     """
     body = await _post("/recall", {"query": query, "top_k": top_k, "project": project,
                                    "since": since, "until": until, "mode": mode})
@@ -107,20 +109,31 @@ async def forget(memory_id: int) -> str:
     return f"Deleted memory {memory_id}."
 
 
+def _web_failure(url: str, e: Exception) -> str:
+    """A page that can't be fetched is an answer, not a tool crash: say why."""
+    return f"Could not fetch {url}: {e}"
+
+
 async def fetch(url: str, mode: str = "clean", selector: Optional[str] = None) -> str:
     """
     Fetch a web page and return its content. `mode`: "clean" (main text,
     default), "markdown", "raw" (HTML), or "extract" (text of a CSS `selector`).
     Private/loopback addresses are refused.
     """
-    body = await _post("/fetch", {"url": url, "mode": mode, "selector": selector})
+    try:
+        body = await _post("/fetch", {"url": url, "mode": mode, "selector": selector})
+    except RuntimeError as e:
+        return _web_failure(url, e)
     head = f"[{body.get('final_url', url)} · {body.get('length', len(body.get('content') or ''))} chars]\n"
     return head + (body.get("content") or "")
 
 
 async def search_page(url: str, pattern: str) -> str:
     """Fetch a page and return the lines (with context) containing `pattern`."""
-    body = await _post("/search", {"url": url, "pattern": pattern})
+    try:
+        body = await _post("/search", {"url": url, "pattern": pattern})
+    except RuntimeError as e:
+        return _web_failure(url, e)
     if not body.get("matches"):
         return f"No lines matching {pattern!r} on {url}."
     return "\n---\n".join(m["context"] for m in body["matches"][:20])
@@ -132,7 +145,10 @@ async def verify(url: str, claim: str, top_k: int = 3) -> str:
     the claim with similarity scores. You decide whether they support,
     contradict, or don't address it.
     """
-    body = await _post("/verify", {"url": url, "claim": claim, "top_k": top_k})
+    try:
+        body = await _post("/verify", {"url": url, "claim": claim, "top_k": top_k})
+    except RuntimeError as e:
+        return _web_failure(url, e)
     if not body.get("matches"):
         return f"No content extracted from {url}."
     out = [f"Claim: {claim}\nSource: {body.get('final_url', url)} "

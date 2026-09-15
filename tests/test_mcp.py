@@ -17,6 +17,8 @@ def _handler(request: httpx.Request) -> httpx.Response:
         }]})
     if path == "/ingest_text":
         return httpx.Response(200, json={"chunks_stored": 1, "total_chunks": 1, "ids": [9]})
+    if path == "/fetch" and request.content and b"missing" in request.content:
+        return httpx.Response(502, json={"error": "Upstream returned HTTP 404", "url": "https://x.example/missing"})
     if path == "/fetch":
         return httpx.Response(200, json={"final_url": "https://x.example/", "length": 5,
                                          "content": "hello"})
@@ -52,9 +54,16 @@ def test_remember_fetch_projects_forget():
     assert asyncio.run(mcp_server.forget(3)) == "No memory with id 3."
 
 
-def test_server_errors_surface_as_messages():
-    with pytest.raises(RuntimeError, match="Refusing to fetch"):
-        asyncio.run(mcp_server.verify("http://localhost/", "claim"))
+def test_web_tool_failures_are_readable_results():
+    out = asyncio.run(mcp_server.verify("http://localhost/", "claim"))
+    assert out == "Could not fetch http://localhost/: Refusing to fetch private/loopback address"
+    out = asyncio.run(mcp_server.fetch("https://x.example/missing"))
+    assert out.startswith("Could not fetch https://x.example/missing: Upstream returned HTTP 404")
+
+
+def test_memory_tool_errors_still_raise():
+    with pytest.raises(RuntimeError, match="unknown"):
+        asyncio.run(mcp_server._post("/nowhere", {}))
 
 
 def test_unreachable_server_message(monkeypatch):

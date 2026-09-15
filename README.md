@@ -77,7 +77,7 @@ To feed that server this machine's Claude Code sessions, mirror them into one of
 
 - **Incremental.** Each session file is tracked by byte offset. Only new lines are read. The last, still-growing chunk is stored so it's searchable immediately and replaced on the next pass.
 - **Dated and scoped.** Every memory carries the session's working directory (project), timestamps, git branch, and title. Filter with `project`, `since`, `until`.
-- **Hybrid.** Dense vectors catch meaning; FTS5 catches the exact port number, hostname, or flag that embeddings blur. Results are fused and gently tilted toward recent memories (30-day half-life; `recency_weight` 0–1).
+- **Hybrid.** Dense vectors catch meaning; FTS5 catches the exact port number, hostname, or flag that embeddings blur. Results are fused and gently tilted toward recent memories (30-day half-life; `recency_weight` 0–1). The `score` on each hit is the fused rank value (typically 0.01–0.04), so compare hits within one query by order, not by magnitude — it is not a cosine similarity like `/verify` reports.
 - **Optional reranker.** `CLOXY_RERANK=1` runs a small cross-encoder over the top 20.
 - **Self-cleaning.** Delete one memory, a whole source, or force a re-ingest; the vector and keyword indexes stay in sync.
 

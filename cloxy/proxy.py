@@ -132,7 +132,7 @@ async def safe_get(url: str, headers: Optional[dict] = None) -> tuple:
                     current = str(resp.url.join(location))
                     continue
                 if resp.status_code >= 400:
-                    raise FetchError(502, f"HTTP {resp.status_code}")
+                    raise FetchError(502, f"Upstream returned HTTP {resp.status_code}")
 
                 ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
                 if ctype.startswith(_BLOCKED_CONTENT_PREFIXES) or ctype in _BLOCKED_CONTENT_TYPES:
