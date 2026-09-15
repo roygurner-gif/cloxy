@@ -46,7 +46,7 @@ CATALOG: List[Model] = [
     Model("Qwen 2.5 32B",
           "mlx-community/Qwen2.5-32B-Instruct-4bit",
           19.0, "large",
-          "Excellent reasoning. SWARM/OMNISCIENT default."),
+          "Excellent reasoning. Best pick for 64 GB Macs."),
     Model("Llama 3.1 70B",
           "mlx-community/Meta-Llama-3.1-70B-Instruct-4bit",
           40.0, "xlarge",
