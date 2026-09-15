@@ -51,6 +51,15 @@ or in `.mcp.json` (Claude Code, Cursor, Continue, Zed all read this shape):
 
 Tools exposed: `recall`, `remember`, `forget`, `fetch`, `search_page`, `verify`, `projects`, `memory_status`. The MCP server is a thin client of the running Cloxy server (`CLOXY_URL`), so every editor shares one index and one embedder.
 
+**Server on another machine?** Put the address and key in `~/.cloxy/client.env` on the client and the CLI / MCP server pick them up:
+
+```
+CLOXY_URL=http://192.168.1.20:9055
+CLOXY_API_KEY=…
+```
+
+To feed that server this machine's Claude Code sessions, mirror them into one of its `CLOXY_WATCH_DIRS` (e.g. a `rsync -a ~/.claude/projects/ host:claude-sessions/$(hostname)/` on a timer).
+
 ## How memory works
 
 ```

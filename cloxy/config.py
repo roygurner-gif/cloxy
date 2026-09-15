@@ -12,6 +12,33 @@ def _flag(name: str, default: str = "") -> bool:
     return os.environ.get(name, default) not in ("", "0", "false", "False", "no")
 
 
+def _load_env_file(path: str) -> None:
+    """
+    Read KEY=VALUE lines into the environment without overriding anything
+    already set. Lets a client machine keep CLOXY_URL / CLOXY_API_KEY in
+    ~/.cloxy/client.env so `cloxy status`, `cloxy recall` and `cloxy mcp`
+    just work.
+    """
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip().strip('"').strip("'")
+                if key.startswith("CLOXY_") or key in ("FASTEMBED_CACHE_PATH", "HF_TOKEN"):
+                    os.environ.setdefault(key, value)
+    except OSError:
+        pass
+
+
+# --- Storage (first: the env file lives here) ---
+DATA_DIR = os.environ.get("CLOXY_DATA_DIR", os.path.expanduser("~/.cloxy"))
+_load_env_file(os.path.join(DATA_DIR, "client.env"))
+DB_PATH = os.path.join(DATA_DIR, "memory.db")
+CONFIG_PATH = Path(os.environ.get("CLOXY_CONFIG", os.path.join(DATA_DIR, "config.json")))
+
 # --- Server ---
 PORT = int(os.environ.get("CLOXY_PORT", 9055))
 # Bind loopback-only by default. Set CLOXY_HOST=0.0.0.0 to expose on the network
@@ -19,11 +46,6 @@ PORT = int(os.environ.get("CLOXY_PORT", 9055))
 HOST = os.environ.get("CLOXY_HOST", "127.0.0.1")
 API_KEY = os.environ.get("CLOXY_API_KEY", "")  # empty = no auth
 URL = os.environ.get("CLOXY_URL", f"http://127.0.0.1:{PORT}")  # what clients (CLI, MCP) talk to
-
-# --- Storage ---
-DATA_DIR = os.environ.get("CLOXY_DATA_DIR", os.path.expanduser("~/.cloxy"))
-DB_PATH = os.path.join(DATA_DIR, "memory.db")
-CONFIG_PATH = Path(os.environ.get("CLOXY_CONFIG", os.path.join(DATA_DIR, "config.json")))
 
 # --- Web proxy ---
 USER_AGENT = os.environ.get(
