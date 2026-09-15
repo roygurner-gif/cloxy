@@ -1,395 +1,223 @@
 # CLOXY
 
-**Local AI with eyes and memory — native to your Mac.**
+**Give your local AI eyes and memory — native to your Mac.**
 
-Cloxy is a lightweight stack that gives you a local LLM plus unrestricted web access plus persistent conversation memory — all running natively on Apple Silicon. One install, one command, your hardware.
+Cloxy is one process that gives any AI tool three things it doesn't have on its own:
 
-## The Problem
+- **Memory that keeps itself.** Cloxy watches your Claude Code sessions and ingests them as they happen. Ask "what did we decide about the auth flow last week" and get the actual conversation back — dated, tagged with the project, ranked by a hybrid semantic + keyword search.
+- **Eyes.** A web proxy that turns any URL into clean text, markdown, or a CSS-selected extract, and a `/verify` endpoint that ranks a page's passages against a claim.
+- **A local LLM** (optional, Apple Silicon). `cloxy init` picks an MLX model that fits your unified memory; `/v1/chat/completions` serves it OpenAI-style — with your memory injected if you want.
 
-Local LLMs are smart but blind and amnesiac:
-- **No web access** — they can't browse the internet, or hit content restrictions when they try
-- **No memory** — every conversation starts from scratch
-- **Multiple tools to set up** — pick a model runtime, pick a model, wire it to your AI tools, hope nothing breaks
+All of it is exposed as an **MCP server**, so Claude Code, Cursor, Continue, and Zed pick it up with one line. Nothing leaves your machine.
 
-## The Solution
+## Install
 
-Cloxy runs on your Mac and provides:
-1. **LLM bootstrap** — `cloxy init` detects your hardware, recommends MLX-Community models that fit in unified memory, downloads your pick, and wires it in. No separate Ollama, no separate LM Studio.
-2. **OpenAI-compatible chat endpoint** — `/v1/chat/completions` works with any tool that speaks the OpenAI API (Continue.dev, Cursor, the `openai` SDK, custom scripts).
-3. **Web Proxy** — fetch any URL, get back clean text, markdown, or raw HTML. No content filtering, no restrictions.
-4. **Conversation Memory** — ingest past conversations into a local RAG database. Your AI can recall what you actually discussed instead of hallucinating.
-
-One install. Your hardware. Your AI.
-
-## What's New in v4.1 — correctness
-
-- **Redirect-safe SSRF guard** — the proxy no longer follows redirects blindly; every hop is re-checked, so a public URL can't 302 the server into `169.254.169.254` or your LAN.
-- **Streamed, capped downloads** — pages are read up to 500 KB and then cut, instead of being downloaded whole and sliced. Obvious binaries (PDF, images, archives) are refused with a 415 instead of being fed to the extractor.
-- **Fetch cache keyed correctly** — `extract` mode with different selectors (or different caller headers) no longer returns a stale cached result.
-- **One generation at a time on MLX** — chat requests are serialized on the GPU; a second request queues instead of contending. A disconnected streaming client stops generation instead of running to `max_tokens`.
-- **Better OpenAI compatibility** — `content` may be a list of parts (as Cursor / Continue / the `openai` SDK send it), `max_completion_tokens` is honored, `finish_reason` is `length` when the budget is hit, and streaming returns `usage`.
-- `/recall` fetches matched rows in one query; `top_k` is bounded; `/ingest_text` payloads are capped.
-- Endpoint test suite (fetch, redirects, cache, memory round-trip, chat request shapes) runs in CI alongside the unit tests.
-
-## What's New in v4.0 — Apple Silicon
-
-- **`cloxy init` wizard** — detects M-series chip + unified memory, recommends MLX models that fit, downloads your pick, persists the config.
-- **MLX backend** — native Apple Silicon inference via `mlx-lm`. Significantly faster than llama.cpp on M-series hardware because it uses the unified-memory architecture directly.
-- **`/v1/chat/completions`** — OpenAI-compatible streaming + non-streaming chat endpoint. Drop-in compatible with any tool that speaks the OpenAI API.
-- **`/v1/models`** — lists the currently-loaded model.
-- **Memory-aware recommendations** — Cloxy won't suggest a model that won't fit. Try anyway with the "Custom" option if you know your hardware; you'll get a warning before the download.
-
-### v4.0 hardening
-
-- **Loopback-only by default** — the server binds `127.0.0.1`. Set `CLOXY_HOST=0.0.0.0` to expose it on your network (do that only behind `CLOXY_API_KEY` — see [Security](#security)).
-- **SSRF guard** — the web proxy refuses to fetch private / loopback / link-local addresses (e.g. `169.254.169.254` cloud metadata, `localhost`, RFC1918) unless you opt in with `CLOXY_ALLOW_PRIVATE_URLS=1`.
-- **Non-blocking embeddings** — embedding now runs off the event loop, so one `/recall` or ingest can't stall every other request.
-- **Race-safe, faster ingest** — batched dedupe + upsert-on-conflict (no read-then-write race); the vector index appends in O(1) instead of rebuilding on every insert.
-- **Forget + reindex** — delete a memory (`DELETE /memory/{id}`), drop a whole source (`/forget`), or rebuild the index from the DB (`/reindex`).
-- **Embedding-model safety** — the embed model + dim are recorded in the DB; Cloxy refuses to start against data built with a different embedder instead of silently corrupting search.
-- **Tests + CI** — a pytest suite (chunking, hashing, vector index, SSRF guard, dedupe) runs on GitHub Actions.
-
-## v3.1
-
-- **`/verify` endpoint** — fetch a URL and rank passages by semantic match to a claim. Cloxy returns the top-K most relevant chunks with cosine similarity scores; the calling agent reads them and decides support/contradiction. Reuses the `/fetch` clean-mode cache so follow-up fetches are free.
-
-## v3.0
-
-- **Numpy matrix vector index** — pre-normalized embeddings, cosine similarity via single matrix multiply. No Python loops, no full table scans.
-- **aiosqlite** — fully async database access, no thread-safety hacks.
-- **SHA256** hashing for content dedup and cache keys.
-- **Optional API key auth** — set `CLOXY_API_KEY` to lock it down.
-- **TTL cache** via cachetools — proper eviction, no hand-rolled LRU.
-- **FastAPI lifespan** — modern lifecycle management, no deprecated decorators.
-
-## Requirements
-
-- **Apple Silicon Mac** (M1, M2, M3, M4 or later) running macOS 13+
-- **Python 3.11+** (numpy 2.4 floor)
-- Enough unified memory for the model you want (see the catalog below)
-
-The **local LLM** is currently Apple Silicon only. The **web proxy + RAG memory** run anywhere Python does — install `requirements-core.txt` and use Cloxy as a proxy/memory backend for an external LLM. Cross-platform local inference (Linux / Windows via `llama-cpp-python`) is on the roadmap as a separate release.
-
-## Quick Start
+Requires Python 3.11+. macOS (Apple Silicon) for the local LLM; the proxy, memory, and MCP server run anywhere.
 
 ```bash
-pip install -r requirements.txt
-python cli.py init      # pick a model, download it
-python cloxy.py         # start the server
+# from a clone
+pip install .            # proxy + memory + MCP
+pip install ".[mlx]"     # + Apple Silicon LLM
+
+# or straight from GitHub
+pipx install "git+https://github.com/roygurner-gif/cloxy"
 ```
 
-Cloxy starts on `http://127.0.0.1:9055`. The LLM is loaded on first chat request, or eagerly at boot if you set `CLOXY_EAGER_LLM=1`.
-
-**Proxy + RAG only (any OS, no local LLM):** the MLX backend is Apple Silicon only. To run just the web proxy and memory (e.g. on Linux, or as a backend for an external LLM), install the core deps and skip `mlx-lm`:
+## Quick start
 
 ```bash
-pip install -r requirements-core.txt
-python cloxy.py
+cloxy start              # server on http://127.0.0.1:9055 — the watcher starts ingesting ~/.claude/projects
+cloxy status             # memories, watcher, index sizes
+cloxy recall "what port does the staging cluster use"
 ```
 
-### Running the tests
+Keep it running across logins (macOS):
 
 ```bash
-pip install -r requirements-core.txt pytest
-pytest -q
+cloxy install-service    # launchd agent; logs in ~/.cloxy/logs/cloxy.log
 ```
 
-### Model catalog
+### Give Claude Code the tools
 
 ```bash
-python cli.py list
+claude mcp add cloxy -- cloxy mcp
 ```
 
-Shipping with curated MLX-Community models from Phi-3 mini (2.5 GB) up through Llama 3.1 405B (220 GB, included as a tongue-in-cheek option for Studio Ultra users).
+or in `.mcp.json` (Claude Code, Cursor, Continue, Zed all read this shape):
 
-### Chat with the LLM (OpenAI-compatible)
-
-```bash
-curl -X POST http://localhost:9055/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "messages": [{"role": "user", "content": "Say hi."}],
-    "max_tokens": 64
-  }'
+```json
+{ "mcpServers": { "cloxy": { "command": "cloxy", "args": ["mcp"] } } }
 ```
 
-### Docker (proxy + RAG only — no LLM)
+Tools exposed: `recall`, `remember`, `forget`, `fetch`, `search_page`, `verify`, `projects`, `memory_status`. The MCP server is a thin client of the running Cloxy server (`CLOXY_URL`), so every editor shares one index and one embedder.
 
-> **Note:** Docker mode runs Cloxy's web proxy, memory, and verify endpoints, but **does not include the local LLM**. MLX needs direct access to Apple Silicon's unified memory and Neural Engine, which standard Docker virtualization doesn't expose. For the full v4 experience (LLM + proxy + memory), run Cloxy natively with `python cloxy.py`. Use Docker only if you're running cloxy as a pure backend for an external LLM.
+## How memory works
 
-```bash
-docker build -t cloxy .
-docker run -p 9055:9055 -v cloxy-data:/data cloxy
-# or:
-docker compose up -d
+```
+~/.claude/projects/**/*.jsonl  ──watcher (5s)──▶  parse new lines from last byte offset
+                                                       │
+                                            pack whole messages into ~1500-char chunks
+                                            header: [2026-09-12 14:40 · rmbr · Board colors]
+                                                       │
+                                     embed (bge-small) ─┼─ SQLite: content + project + session
+                                                        │           + ts_start/ts_end + metadata
+                                        numpy vector index   +   FTS5 keyword index
+                                                       │
+                              /recall = dense ⊕ BM25 (reciprocal rank fusion) × recency
 ```
 
-## Why MLX (not Ollama or llama.cpp)?
+- **Incremental.** Each session file is tracked by byte offset. Only new lines are read. The last, still-growing chunk is stored so it's searchable immediately and replaced on the next pass.
+- **Dated and scoped.** Every memory carries the session's working directory (project), timestamps, git branch, and title. Filter with `project`, `since`, `until`.
+- **Hybrid.** Dense vectors catch meaning; FTS5 catches the exact port number, hostname, or flag that embeddings blur. Results are fused and gently tilted toward recent memories (30-day half-life; `recency_weight` 0–1).
+- **Optional reranker.** `CLOXY_RERANK=1` runs a small cross-encoder over the top 20.
+- **Self-cleaning.** Delete one memory, a whole source, or force a re-ingest; the vector and keyword indexes stay in sync.
 
-MLX is Apple's machine-learning framework, designed specifically for the unified-memory architecture of M-series chips. On Apple Silicon it's materially faster than llama.cpp-based runtimes (Ollama, LM Studio) because there's no abstraction layer between the model weights and the GPU — the model lives in the same memory the GPU reads from.
-
-For Cloxy specifically, MLX also fits cleanly into the FastAPI Python stack with no separate daemon, no HTTP roundtrip between proxy and LLM, no extra process to manage. Cloxy + LLM is **one Python process, one port, one install**.
-
-Cross-platform support (Linux via vLLM or `llama-cpp-python`, Windows via `llama-cpp-python`) is planned as a separate release. v4 is intentionally Apple Silicon native.
-
-## Integrations
-
-Cloxy's `/v1/chat/completions` is OpenAI-compatible, so anything that speaks the OpenAI API can use it.
-
-> **Claude Code** speaks the Anthropic Messages API, not the OpenAI one, so it can't use Cloxy as its model. It *can* use Cloxy's eyes and memory: point it at `/fetch`, `/recall`, and `/verify` with `curl` (an MCP server is on the roadmap).
-
-### Continue.dev (VS Code / JetBrains)
-
-In your `~/.continue/config.json`:
-
-```jsonc
-{
-  "models": [{
-    "title": "Cloxy (local)",
-    "provider": "openai",
-    "model": "cloxy",
-    "apiBase": "http://localhost:9055/v1",
-    "apiKey": "not-required"
-  }]
-}
-```
-
-### Cursor
-
-Settings → Models → Add custom OpenAI-compatible model:
-- Name: `cloxy`
-- Base URL: `http://localhost:9055/v1`
-- API key: anything (or your `CLOXY_API_KEY` if set)
-
-### Plain OpenAI Python SDK
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://localhost:9055/v1",
-    api_key="not-required",
-)
-
-resp = client.chat.completions.create(
-    model="cloxy",
-    messages=[{"role": "user", "content": "Summarize the v4 release."}],
-)
-print(resp.choices[0].message.content)
-```
-
-## Performance
-
-Approximate throughput on common Apple Silicon configs (4-bit MLX models, single user, no streaming overhead). Real numbers vary with context length, prompt complexity, and what else your Mac is doing.
-
-| Hardware | Model | Tokens/sec (approx) |
-|---|---|---|
-| M2 16 GB | Qwen 2.5 7B | ~35-50 |
-| M3 Pro 32 GB | Qwen 2.5 14B | ~25-35 |
-| M4 32 GB | Qwen 2.5 14B | ~30-40 |
-| M4 Pro 64 GB | Qwen 2.5 32B | ~18-25 |
-| M3 Ultra 192 GB | Llama 3.1 70B | ~12-18 |
-
-MLX is generally 1.5-2.5x faster than llama.cpp / Ollama on the same Apple Silicon hardware, and uses unified memory more efficiently.
-
-## Usage
-
-### Fetch a webpage
-
-```bash
-# Clean text (default — strips nav, ads, scripts)
-curl -X POST http://localhost:9055/fetch \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://breakingdefense.com", "mode": "clean"}'
-
-# Markdown
-curl -X POST http://localhost:9055/fetch \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com", "mode": "markdown"}'
-
-# Raw HTML
-curl -X POST http://localhost:9055/fetch \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com", "mode": "raw"}'
-
-# Extract specific CSS selector
-curl -X POST http://localhost:9055/fetch \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com", "mode": "extract", "selector": "h2.title"}'
-```
-
-### Search a webpage for a pattern
-
-```bash
-curl -X POST http://localhost:9055/search \
-  -H "Content-Type: application/json" \
-  -d '{"url": "https://example.com", "pattern": "quarterly revenue"}'
-```
-
-### Verify a claim against a webpage
-
-```bash
-curl -X POST http://localhost:9055/verify \
-  -H "Content-Type: application/json" \
-  -d '{
-    "url": "https://justice.gov/opa/pr/...",
-    "claim": "Castro was indicted for the 1996 Brothers to the Rescue shootdown",
-    "top_k": 3
-  }'
-```
-
-Returns the top-K cleaned passages from the page ranked by cosine similarity against the claim. The calling agent reads the passages and decides whether they support, contradict, or fail to address the claim. Cloxy stays a tool, not a judge.
-
-### Ingest Claude Code conversations
-
-```bash
-# Ingest all conversations from Claude Code
-curl -X POST http://localhost:9055/ingest_convos \
-  -H "Content-Type: application/json" \
-  -d '{"convo_dir": "~/.claude/projects"}'
-```
-
-### Ingest any text
-
-```bash
-curl -X POST http://localhost:9055/ingest_text \
-  -H "Content-Type: application/json" \
-  -d '{"text": "Important context to remember...", "source": "meeting-notes"}'
-```
-
-### Recall from memory
-
-```bash
-curl -X POST http://localhost:9055/recall \
-  -H "Content-Type: application/json" \
-  -d '{"query": "what architecture did we decide on", "top_k": 5}'
-```
-
-### With API key auth
-
-```bash
-# Set the key
-export CLOXY_API_KEY="your-secret-key"
-python cloxy.py
-
-# Include in requests
-curl -X POST http://localhost:9055/fetch \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: your-secret-key" \
-  -d '{"url": "https://example.com", "mode": "clean"}'
-```
-
-### Check status
-
-```bash
-curl http://localhost:9055/health
-curl http://localhost:9055/memory_stats
-```
+Existing v3/v4 databases migrate in place on first start.
 
 ## Endpoints
 
 | Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions (streaming + non-streaming) |
-| `GET` | `/v1/models` | List currently-loaded model (OpenAI shape) |
-| `POST` | `/fetch` | Fetch and clean a URL |
-| `POST` | `/search` | Fetch URL, extract lines matching a pattern (keyword/substring) |
-| `POST` | `/verify` | Fetch URL, rank passages by semantic match to a claim |
-| `POST` | `/ingest_convos` | Parse Claude Code conversations into memory |
-| `POST` | `/ingest_text` | Store any text into memory |
-| `POST` | `/recall` | Semantic search over memory (numpy vector index) |
-| `DELETE` | `/memory/{id}` | Delete a single memory by id (keeps the index in sync) |
-| `POST` | `/forget` | Delete memories by source prefix (e.g. `convo:` or a session id) |
-| `POST` | `/reindex` | Rebuild the vector index from the database |
-| `GET` | `/memory_stats` | Memory database stats |
-| `GET` | `/health` | Health check |
-| `GET` | `/` | Service info |
+|---|---|---|
+| `POST` | `/recall` | Hybrid search. `{query, top_k, mode: hybrid\|dense\|keyword, project, since, until, recency_weight, rerank}` |
+| `POST` | `/ingest_text` | Store any text. `{text, source, project?, metadata?}` |
+| `POST` | `/ingest_convos` | Run an ingest pass now. `{convo_dir?, force?}` |
+| `GET` | `/projects` | Projects present in memory with counts and date ranges |
+| `GET` | `/ingest_status` | Watcher state |
+| `GET` | `/memory_stats` | Counts, sources, index sizes |
+| `DELETE` | `/memory/{id}` | Delete one memory |
+| `POST` | `/forget` | Delete memories by source prefix (`convo:`, a session id, `manual`…) |
+| `POST` | `/reindex` | Rebuild the vector + keyword indexes from the DB |
+| `POST` | `/fetch` | Fetch a URL. `{url, mode: clean\|raw\|markdown\|extract, selector?, headers?}` |
+| `POST` | `/search` | Fetch a URL, return lines containing a pattern |
+| `POST` | `/verify` | Fetch a URL, rank passages by semantic match to a claim |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat (streaming or not). Extra: `memory`, `memory_top_k`, `memory_project` |
+| `GET` | `/v1/models` | The currently loaded model |
+| `GET` | `/health` | Health + watcher summary |
 
-## Fetch Modes
+### Examples
 
-| Mode | Description |
-|------|-------------|
-| `clean` | Main content extracted via trafilatura (default) |
-| `raw` | Full HTML response |
-| `markdown` | HTML converted to markdown |
-| `extract` | Content from specific CSS selector |
+```bash
+# recall, scoped to one project since a date
+curl -s localhost:9055/recall -H 'content-type: application/json' \
+  -d '{"query":"why did we switch to WAL mode","project":"cloxy","since":"2026-09-01","top_k":3}'
+
+# remember something
+curl -s localhost:9055/ingest_text -H 'content-type: application/json' \
+  -d '{"text":"Staging DB is read-only on Fridays.","source":"decision","project":"/w/infra"}'
+
+# read a page as clean text
+curl -s localhost:9055/fetch -H 'content-type: application/json' \
+  -d '{"url":"https://example.com","mode":"clean"}'
+
+# check a claim against a page
+curl -s localhost:9055/verify -H 'content-type: application/json' \
+  -d '{"url":"https://example.com/press","claim":"Revenue grew 12% year over year","top_k":3}'
+```
+
+`/verify` returns the top-K passages with cosine scores. The caller decides support/contradiction — Cloxy stays a tool, not a judge.
+
+## Local LLM (Apple Silicon)
+
+```bash
+pip install ".[mlx]"
+cloxy init               # detects chip + memory, recommends MLX models that fit, downloads your pick
+cloxy start
+```
+
+The model loads on first request (or at startup with `CLOXY_EAGER_LLM=1`). Any OpenAI-compatible client works:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:9055/v1", api_key="not-required")
+resp = client.chat.completions.create(
+    model="cloxy",
+    messages=[{"role": "user", "content": "What did we decide about the auth flow?"}],
+    extra_body={"memory": True},          # prepend relevant recall to the prompt
+)
+print(resp.choices[0].message.content)
+```
+
+Continue.dev / Cursor: add an OpenAI-compatible model with base URL `http://localhost:9055/v1` and any API key (or your `CLOXY_API_KEY`).
+
+> Claude Code speaks the Anthropic Messages API, not the OpenAI one, so it can't use Cloxy as its *model* — but it uses Cloxy's memory and eyes through MCP (above).
+
+Why MLX: it's Apple's framework for the unified-memory architecture, it runs in-process (no daemon, no HTTP hop between proxy and model), and it's fast on M-series parts. Cross-platform inference via `llama-cpp-python` is planned as a separate extra.
+
+## CLI
+
+```
+cloxy start [--host H] [--port P]   run the server
+cloxy mcp                           MCP stdio server (for editors)
+cloxy recall QUERY [-k N] [--project P] [--since D] [--until D] [--mode M] [--full] [--json]
+cloxy ingest [DIR] [--force]        run an ingest pass now
+cloxy status                        health, memory, watcher
+cloxy install-service | uninstall-service   launchd (macOS)
+cloxy init | show | list            local LLM setup
+```
 
 ## Configuration
 
-All config via environment variables:
+Everything is an environment variable.
 
 | Variable | Default | Description |
-|----------|---------|-------------|
+|---|---|---|
 | `CLOXY_PORT` | `9055` | Server port |
-| `CLOXY_HOST` | `127.0.0.1` | Bind address. Set `0.0.0.0` to expose on the network (use with `CLOXY_API_KEY`) |
-| `CLOXY_DATA_DIR` | `~/.cloxy` | Database and data directory |
-| `CLOXY_API_KEY` | *(none)* | API key for auth (empty = open) |
-| `CLOXY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model for memory |
-| `CLOXY_EMBED_DIM` | `384` | Embedding dimension (must match the model; recorded in the DB) |
-| `CLOXY_ALLOW_PRIVATE_URLS` | *(unset)* | If `1`, let the proxy fetch private/loopback addresses (SSRF risk) |
+| `CLOXY_HOST` | `127.0.0.1` | Bind address. `0.0.0.0` exposes it on the network — set an API key |
+| `CLOXY_URL` | `http://127.0.0.1:9055` | Where the CLI and MCP server find the server |
+| `CLOXY_API_KEY` | *(none)* | API key (`X-API-Key` header). Empty = open |
+| `CLOXY_DATA_DIR` | `~/.cloxy` | Database, LLM config, logs |
+| `CLOXY_WATCH` | `1` | Run the conversation watcher |
+| `CLOXY_WATCH_DIRS` | `~/.claude/projects` | Directories to watch (`:`-separated) |
+| `CLOXY_WATCH_INTERVAL` | `5` | Seconds between scans |
+| `CLOXY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (recorded in the DB; changing it needs a fresh data dir) |
+| `CLOXY_EMBED_DIM` | `384` | Must match the model |
+| `CLOXY_RERANK` | *(unset)* | `1` to rerank the top 20 with a cross-encoder |
+| `CLOXY_RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Reranker |
+| `CLOXY_CHAT_MEMORY` | *(unset)* | `1` to inject memory into every chat completion by default |
+| `CLOXY_CHAT_MEMORY_TOP_K` | `5` | How many memories to inject |
+| `CLOXY_ALLOW_PRIVATE_URLS` | *(unset)* | `1` lets the proxy fetch private/loopback addresses (SSRF risk) |
 | `CLOXY_USER_AGENT` | Chrome UA | User agent for web requests |
-| `CLOXY_FETCH_TIMEOUT` | `30` | Web fetch timeout in seconds |
-| `CLOXY_CONFIG` | `~/.cloxy/config.json` | LLM config file written by `cli.py init` |
-| `CLOXY_EAGER_LLM` | *(unset)* | If `1`, load the LLM at server startup instead of on first request |
+| `CLOXY_FETCH_TIMEOUT` | `30` | Web fetch timeout, seconds |
+| `CLOXY_CONFIG` | `~/.cloxy/config.json` | LLM config written by `cloxy init` |
+| `CLOXY_EAGER_LLM` | *(unset)* | `1` loads the LLM at startup |
 
 ## Security
 
-Cloxy is built to run locally, and the defaults reflect that:
+- **Loopback by default.** Nothing is reachable off your machine unless you set `CLOXY_HOST=0.0.0.0`.
+- **If you expose it, set an API key.** Otherwise anyone on the network can read and write your memory. The key is compared in constant time.
+- **SSRF guard.** `/fetch`, `/search`, `/verify` resolve the target and refuse private, loopback, link-local, and cloud-metadata addresses — and re-check every redirect hop (max 5). Bodies are streamed and cut at 500 KB; binary content types are refused.
+- **Your transcripts stay local.** The watcher reads `~/.claude/projects` on this machine and writes to `~/.cloxy/memory.db`. No telemetry. The only outbound traffic is `/fetch` requests you make and one-time model downloads.
 
-- **Binds `127.0.0.1` by default.** Nothing is reachable off your machine unless you set `CLOXY_HOST=0.0.0.0`.
-- **If you expose it, set an API key.** `CLOXY_HOST=0.0.0.0` with no `CLOXY_API_KEY` means anyone on your network can use your proxy, read/write your memory, and drive your LLM. Cloxy prints a warning at startup in that configuration. The key is checked with a constant-time compare.
-- **SSRF guard on the proxy.** `/fetch`, `/search`, and `/verify` resolve the target host and refuse private, loopback, link-local, and cloud-metadata addresses — and re-check every redirect hop (max 5), so a public page can't bounce the server into an internal address. This stops an exposed instance from being used to pivot into internal services. Opt out for local scraping with `CLOXY_ALLOW_PRIVATE_URLS=1`.
+## Docker (proxy + memory + MCP; no LLM, no watcher)
 
-> The Docker image sets `CLOXY_HOST=0.0.0.0` because a container needs it for the mapped port to work — so **set `CLOXY_API_KEY` when running under Docker.**
-
-## How It Works
-
-**Web Proxy**: Cloxy fetches URLs using httpx with a real browser user agent, then extracts clean content using trafilatura (the same library used by academic web scraping projects). Results are cached for 15 minutes.
-
-**Memory**: Conversations are parsed from Claude Code's JSONL format, chunked into ~1500 character segments with overlap, embedded using a local embedding model (BAAI/bge-small-en-v1.5 via fastembed), and stored in SQLite. Recall uses an in-memory numpy matrix — cosine similarity via single matrix multiply, no Python loops or table scans.
-
-## Architecture
-
-```
-[Your AI tool] --HTTP--> [Cloxy :9055]
-                            ├── /v1/chat/completions --> MLX --> Qwen/Llama in unified memory
-                            ├── /fetch               --> httpx --> any website
-                            ├── /recall              --> numpy vector index --> semantic search
-                            └── /ingest              --> chunk + embed --> SQLite + vec
+```bash
+docker build -t cloxy .
+docker run -p 9055:9055 -v cloxy-data:/data -e CLOXY_API_KEY=change-me cloxy
+# or: docker compose up -d
 ```
 
-Everything runs locally. No external APIs. No telemetry. No cloud. The LLM, the web proxy, the memory index — all in one Python process on your Mac.
+The image binds `0.0.0.0` (containers need that) — set `CLOXY_API_KEY`. Feed it with `/ingest_text` or `/ingest_convos` against a mounted directory.
 
-## Stack
+## Development
 
-- Python 3.11+ / FastAPI / uvicorn
-- **MLX / mlx-lm** for LLM inference (Apple Silicon native)
-- httpx / trafilatura / BeautifulSoup / markdownify
-- fastembed (BAAI/bge-small-en-v1.5) / numpy / aiosqlite
-- cachetools (TTL cache)
+```bash
+pip install -e ".[dev]"
+pytest -q
+```
+
+The suite (no network, no models) covers the SSRF guard and redirect walking, cache keys, hybrid recall and filters, incremental ingest, migration, the MCP tools, and the OpenAI request shapes.
 
 ## FAQ
 
-**Q: Can I use my own model that isn't in the catalog?**
-Yes. `cloxy init` has a "Custom" option — enter any Hugging Face MLX model id (typically from the `mlx-community` org). The wizard will warn if it looks unreasonably large for your hardware but will let you proceed.
+**Does it work offline?** Yes. Memory, recall, and the local LLM are offline once models are downloaded. `/fetch` needs the network.
 
-**Q: Does Cloxy work offline?**
-Yes, once a model is downloaded. The LLM, RAG, and memory all run locally. The web proxy obviously needs network access for `/fetch`, but the LLM and `/recall` don't.
+**What if I change the embedding model?** Cloxy refuses to start against a database built with a different model or dimension. Point `CLOXY_DATA_DIR` at a fresh directory and let the watcher rebuild.
 
-**Q: Can I run multiple models?**
-Currently Cloxy loads one model at a time. Switching means running `cloxy init` again and restarting. Multi-model support is a possible future feature.
+**Can I use a model not in the catalog?** `cloxy init` → Custom → any Hugging Face MLX id (usually `mlx-community/...`).
 
-**Q: Why no Linux / Windows support?**
-v4 is intentionally Apple Silicon native to take full advantage of MLX. A separate release with `llama-cpp-python` as a cross-platform fallback is on the roadmap. The Apple Silicon focus is deliberate — it's where unified memory makes commodity-hardware AI viable in ways x86 + discrete GPU can't match without dedicated server-class hardware.
+**How is this different from Ollama / LM Studio?** They serve models. Cloxy is the memory and eyes around a model — with a small model of its own on Apple Silicon. Point Cloxy at Ollama's OpenAI endpoint if you prefer it as the brain; the memory works the same.
 
-**Q: Is my data sent anywhere?**
-No. No telemetry, no analytics, no model usage reporting. Cloxy is local-only. The only outbound traffic is `/fetch` calls to URLs you explicitly request, and one-time model downloads from Hugging Face.
-
-**Q: How does Cloxy compare to Ollama?**
-Ollama is great. It's cross-platform and has a huge model registry. Cloxy is narrower (Apple Silicon only, one model at a time) but adds two things Ollama doesn't have built-in: persistent RAG memory and an integrated web proxy. Think of Cloxy as "Ollama + eyes + memory, native to Apple Silicon."
-
-**Q: How does Cloxy compare to LM Studio?**
-LM Studio has a GUI and broader model support. Cloxy is CLI-only and Apple Silicon focused, with web access and memory as first-class features instead of add-ons.
+**Is my data sent anywhere?** No.
 
 ## License
 
