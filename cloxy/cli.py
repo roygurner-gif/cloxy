@@ -274,6 +274,35 @@ def _launchctl(*args) -> subprocess.CompletedProcess:
     return subprocess.run(["launchctl", *args], capture_output=True, text=True)
 
 
+def _service_command() -> list:
+    """
+    Launch via the `cloxy` console script next to the interpreter when it
+    exists. `python -m cloxy` puts the working directory on sys.path, and a
+    checkout at ~/cloxy would shadow the installed package.
+    """
+    script = Path(sys.executable).parent / "cloxy"
+    if script.is_file() and os.access(script, os.X_OK):
+        return [str(script), "start"]
+    return [sys.executable, "-m", "cloxy", "start"]
+
+
+def service_plist(log_dir: Path) -> dict:
+    env = {k: v for k, v in os.environ.items()
+           if k.startswith("CLOXY_") or k in ("FASTEMBED_CACHE_PATH", "HF_HOME", "HF_TOKEN")}
+    env["PATH"] = os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin")
+    return {
+        "Label": PLIST_LABEL,
+        "ProgramArguments": _service_command(),
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        # Not $HOME: nothing there should end up importable.
+        "WorkingDirectory": str(Path(config.DATA_DIR)),
+        "StandardOutPath": str(log_dir / "cloxy.log"),
+        "StandardErrorPath": str(log_dir / "cloxy.log"),
+        "EnvironmentVariables": env,
+    }
+
+
 def cmd_install_service(args: argparse.Namespace) -> int:
     if sys.platform != "darwin":
         print("install-service uses launchd and is macOS only. On Linux, run `cloxy start` "
@@ -281,24 +310,14 @@ def cmd_install_service(args: argparse.Namespace) -> int:
         return 1
     log_dir = Path(config.DATA_DIR) / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    env = {k: v for k, v in os.environ.items() if k.startswith("CLOXY_")}
-    env["PATH"] = os.environ.get("PATH", "/usr/bin:/bin:/usr/local/bin")
-    plist = {
-        "Label": PLIST_LABEL,
-        "ProgramArguments": [sys.executable, "-m", "cloxy", "start"],
-        "RunAtLoad": True,
-        "KeepAlive": True,
-        "WorkingDirectory": str(Path.home()),
-        "StandardOutPath": str(log_dir / "cloxy.log"),
-        "StandardErrorPath": str(log_dir / "cloxy.log"),
-        "EnvironmentVariables": env,
-    }
+    plist = service_plist(log_dir)
     PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     domain = f"gui/{os.getuid()}"
     if PLIST_PATH.exists():
         _launchctl("bootout", domain, str(PLIST_PATH))
     with open(PLIST_PATH, "wb") as f:
         plistlib.dump(plist, f)
+    PLIST_PATH.chmod(0o600)   # may carry CLOXY_API_KEY
     res = _launchctl("bootstrap", domain, str(PLIST_PATH))
     if res.returncode != 0:
         print(f"launchctl bootstrap failed: {res.stderr.strip() or res.stdout.strip()}")
