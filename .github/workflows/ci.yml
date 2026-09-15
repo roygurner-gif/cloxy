@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
 
@@ -19,11 +19,17 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
 
-      - name: Install core deps + pytest
-        # Core only — the MLX backend is Apple Silicon and can't install on CI.
+      - name: Install package + test deps
+        # Core only — the MLX extra is Apple Silicon and can't install on CI.
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements-core.txt pytest
+          pip install -e ".[dev]"
 
       - name: Run tests
         run: pytest -q
+
+      - name: CLI smoke
+        run: |
+          cloxy --version
+          cloxy list | head -3
+          python -m cloxy --help > /dev/null

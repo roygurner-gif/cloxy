@@ -1,7 +1,3 @@
-# Full install (Apple Silicon): core server + the MLX LLM backend.
--r requirements-core.txt
-
-# Apple Silicon LLM backend (mlx-lm pulls mlx as a dependency).
-# Apple Silicon only — on Linux/Windows install requirements-core.txt instead
-# and run Cloxy as a proxy + RAG service without the local LLM.
-mlx-lm>=0.31.0
+# Full install (Apple Silicon): server + MCP + the MLX LLM backend.
+# Equivalent to: pip install ".[mlx]"
+.[mlx]
