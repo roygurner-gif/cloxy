@@ -31,8 +31,6 @@ Usage:
     # Recall from memory
     curl -X POST http://localhost:9055/recall -H "Content-Type: application/json" \
         -d '{"query": "what did we build last week"}'
-
-Roy Gurner | Occam Engineering | 2026
 """
 import os
 import sys

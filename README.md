@@ -394,7 +394,3 @@ LM Studio has a GUI and broader model support. Cloxy is CLI-only and Apple Silic
 ## License
 
 MIT
-
-## Author
-
-Roy Gurner — [roygurner.com](https://roygurner.com)
