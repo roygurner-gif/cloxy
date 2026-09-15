@@ -39,7 +39,6 @@ import hashlib
 import json
 import re
 import glob as globmod
-import struct
 import socket
 import ipaddress
 import secrets
@@ -48,7 +47,7 @@ import logging
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Optional, List
+from typing import Optional, List, Union
 from urllib.parse import urlparse
 from pathlib import Path
 
@@ -62,11 +61,11 @@ from fastembed import TextEmbedding
 from fastapi import FastAPI, Request, Depends, HTTPException
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.security import APIKeyHeader
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from cachetools import TTLCache
 
 # --- Version (single source of truth) ---
-__version__ = "4.0"
+__version__ = "4.1"
 
 # --- Config ---
 PORT = int(os.environ.get("CLOXY_PORT", 9055))
@@ -80,7 +79,9 @@ USER_AGENT = os.environ.get("CLOXY_USER_AGENT",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 FETCH_TIMEOUT = float(os.environ.get("CLOXY_FETCH_TIMEOUT", 30))
-MAX_CONTENT_LENGTH = 500_000
+MAX_CONTENT_LENGTH = 500_000      # bytes read from a fetched page (streamed, then cut)
+MAX_REDIRECTS = 5                 # each hop is re-checked by the SSRF guard
+MAX_INGEST_CHARS = 2_000_000      # cap on a single /ingest_text payload
 # Allow the proxy to reach private/loopback/link-local addresses. Off by default
 # so an exposed instance can't be used to pivot into internal services / cloud
 # metadata (169.254.169.254). Set CLOXY_ALLOW_PRIVATE_URLS=1 for local scraping.
@@ -303,15 +304,8 @@ async def load_vector_index():
         logger.info("Vector index: empty (no embeddings in DB)")
         return
 
-    ids = []
-    embeddings = []
-    for row in rows:
-        chunk_id = row[0]
-        blob = row[1]
-        n = len(blob) // 4
-        vec = np.array(struct.unpack(f"{n}f", blob), dtype=np.float32)
-        ids.append(chunk_id)
-        embeddings.append(vec)
+    ids = [row[0] for row in rows]
+    embeddings = [unpack_embedding(row[1]) for row in rows]
 
     vec_index.load(ids, embeddings)
     logger.info(f"Vector index: loaded {len(ids)} embeddings into memory")
@@ -395,7 +389,12 @@ async def aembed_batch(texts: List[str]) -> List[np.ndarray]:
 
 
 def pack_embedding(vec: np.ndarray) -> bytes:
-    return struct.pack(f"{len(vec)}f", *vec)
+    # Native-endian float32, byte-identical to the old struct.pack("Nf") layout.
+    return np.asarray(vec, dtype=np.float32).tobytes()
+
+
+def unpack_embedding(blob: bytes) -> np.ndarray:
+    return np.frombuffer(blob, dtype=np.float32)
 
 
 # =============================================================================
@@ -512,8 +511,12 @@ async def existing_hashes(db, hashes: List[str]) -> set:
     return found
 
 
-def cache_key(url: str, mode: str) -> str:
-    return hashlib.sha256(f"{url}:{mode}".encode()).hexdigest()
+def cache_key(url: str, mode: str, selector: Optional[str] = None,
+              headers: Optional[dict] = None) -> str:
+    # Selector and caller headers change the result, so they're part of the key —
+    # otherwise `extract` with "h1" then "h2" on one URL served the h1 result.
+    hdrs = json.dumps(sorted(headers.items())) if headers else ""
+    return hashlib.sha256(f"{url}:{mode}:{selector or ''}:{hdrs}".encode()).hexdigest()
 
 
 # =============================================================================
@@ -566,6 +569,81 @@ def validate_fetch_url(url: str) -> Optional[str]:
 
 
 # =============================================================================
+# SAFE FETCH — redirect-aware SSRF guard, streamed + capped body
+# =============================================================================
+
+class FetchError(Exception):
+    """A fetch failed in a way we want to surface as a specific HTTP status."""
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+# Binary payloads that trafilatura/BeautifulSoup would only turn into noise.
+_BLOCKED_CONTENT_PREFIXES = ("image/", "video/", "audio/", "font/")
+_BLOCKED_CONTENT_TYPES = {
+    "application/pdf", "application/zip", "application/gzip",
+    "application/x-tar", "application/octet-stream",
+}
+
+
+def _make_client() -> httpx.AsyncClient:
+    # Redirects are walked by hand in safe_get so every hop passes the SSRF
+    # guard; with follow_redirects=True a public URL could 302 to 169.254.169.254.
+    return httpx.AsyncClient(follow_redirects=False, timeout=FETCH_TIMEOUT)
+
+
+async def safe_get(url: str, headers: dict) -> tuple:
+    """
+    GET `url` and return (text, status_code, final_url).
+
+    - Validates the URL and every redirect target against the SSRF guard.
+    - Streams the body and stops reading at MAX_CONTENT_LENGTH bytes, so a
+      huge response never lands in memory whole.
+    - Refuses obvious binary content types.
+    Raises FetchError with the status to return to the caller.
+    """
+    current = url
+    async with _make_client() as client:
+        for _ in range(MAX_REDIRECTS + 1):
+            blocked = validate_fetch_url(current)
+            if blocked:
+                raise FetchError(400, blocked)
+
+            async with client.stream("GET", current, headers=headers) as resp:
+                if resp.is_redirect:
+                    location = resp.headers.get("location")
+                    if not location:
+                        raise FetchError(502, "Redirect without Location header")
+                    current = str(resp.url.join(location))
+                    continue
+                if resp.status_code >= 400:
+                    raise FetchError(502, f"HTTP {resp.status_code}")
+
+                ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                if ctype.startswith(_BLOCKED_CONTENT_PREFIXES) or ctype in _BLOCKED_CONTENT_TYPES:
+                    raise FetchError(415, f"Unsupported content type: {ctype}")
+
+                buf = bytearray()
+                async for part in resp.aiter_bytes():
+                    buf.extend(part)
+                    if len(buf) >= MAX_CONTENT_LENGTH:
+                        break
+                encoding = resp.charset_encoding or "utf-8"
+                text = bytes(buf[:MAX_CONTENT_LENGTH]).decode(encoding, errors="replace")
+                return text, resp.status_code, str(resp.url)
+
+    raise FetchError(502, f"Too many redirects (>{MAX_REDIRECTS})")
+
+
+def _fetch_error_response(e: Exception, url: str) -> JSONResponse:
+    if isinstance(e, FetchError):
+        return JSONResponse(status_code=e.status, content={"error": e.message, "url": url})
+    return JSONResponse(status_code=502, content={"error": str(e), "url": url})
+
+
+# =============================================================================
 # REQUEST MODELS
 # =============================================================================
 
@@ -588,19 +666,19 @@ class IngestConvoRequest(BaseModel):
 
 
 class IngestTextRequest(BaseModel):
-    text: str
+    text: str = Field(..., max_length=MAX_INGEST_CHARS)
     source: str = "manual"
 
 
 class RecallRequest(BaseModel):
     query: str
-    top_k: int = 5
+    top_k: int = Field(5, ge=1, le=100)
 
 
 class VerifyRequest(BaseModel):
     url: str
     claim: str
-    top_k: int = 3
+    top_k: int = Field(3, ge=1, le=50)
 
 
 class DeleteBySourceRequest(BaseModel):
@@ -677,31 +755,23 @@ async def health():
 async def fetch(req: FetchRequest):
     logger.info(f"FETCH url={req.url} mode={req.mode}")
 
-    blocked = validate_fetch_url(req.url)
-    if blocked:
-        return JSONResponse(status_code=400, content={"error": blocked})
+    if req.mode not in ("clean", "raw", "markdown", "extract"):
+        return JSONResponse(status_code=400, content={"error": f"Unknown mode: {req.mode}"})
+    if req.mode == "extract" and not req.selector:
+        return JSONResponse(status_code=400, content={"error": "selector required for extract mode"})
 
-    ckey = cache_key(req.url, req.mode)
+    ckey = cache_key(req.url, req.mode, req.selector, req.headers)
     cached = _cache.get(ckey)
     if cached:
-        cached["from_cache"] = True
-        return cached
+        return {**cached, "from_cache": True}
 
+    headers = {"User-Agent": USER_AGENT}
+    if req.headers:
+        headers.update(req.headers)
     try:
-        headers = {"User-Agent": USER_AGENT}
-        if req.headers:
-            headers.update(req.headers)
-
-        async with httpx.AsyncClient(follow_redirects=True, timeout=FETCH_TIMEOUT) as client:
-            resp = await client.get(req.url, headers=headers)
-            resp.raise_for_status()
-            html = resp.text[:MAX_CONTENT_LENGTH]
-            status = resp.status_code
-            final_url = str(resp.url)
-    except httpx.HTTPStatusError as e:
-        return JSONResponse(status_code=502, content={"error": f"HTTP {e.response.status_code}", "url": req.url})
+        html, status, final_url = await safe_get(req.url, headers)
     except Exception as e:
-        return JSONResponse(status_code=502, content={"error": str(e), "url": req.url})
+        return _fetch_error_response(e, req.url)
 
     result = {
         "url": req.url,
@@ -734,8 +804,6 @@ async def fetch(req: FetchRequest):
         result["length"] = len(result["content"])
 
     elif req.mode == "extract":
-        if not req.selector:
-            return JSONResponse(status_code=400, content={"error": "selector required for extract mode"})
         soup = BeautifulSoup(html, "html.parser")
         elements = soup.select(req.selector)
         result["content"] = "\n---\n".join(el.get_text(strip=True) for el in elements)
@@ -750,17 +818,10 @@ async def fetch(req: FetchRequest):
 async def search_extract(req: SearchExtract):
     logger.info(f"SEARCH url={req.url} pattern={req.pattern}")
 
-    blocked = validate_fetch_url(req.url)
-    if blocked:
-        return JSONResponse(status_code=400, content={"error": blocked})
-
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=FETCH_TIMEOUT) as client:
-            resp = await client.get(req.url, headers={"User-Agent": USER_AGENT})
-            resp.raise_for_status()
-            html = resp.text[:MAX_CONTENT_LENGTH]
+        html, _, _ = await safe_get(req.url, {"User-Agent": USER_AGENT})
     except Exception as e:
-        return JSONResponse(status_code=502, content={"error": str(e)})
+        return _fetch_error_response(e, req.url)
 
     cleaned = trafilatura.extract(html, include_links=True) or ""
     lines = cleaned.split("\n")
@@ -796,10 +857,6 @@ async def verify(req: VerifyRequest):
     """
     logger.info(f"VERIFY url={req.url} claim='{req.claim[:80]}'")
 
-    blocked = validate_fetch_url(req.url)
-    if blocked:
-        return JSONResponse(status_code=400, content={"error": blocked})
-
     # Reuse /fetch clean-mode cache if present
     ckey = cache_key(req.url, "clean")
     cached = _cache.get(ckey)
@@ -809,15 +866,9 @@ async def verify(req: VerifyRequest):
         from_cache = True
     else:
         try:
-            async with httpx.AsyncClient(follow_redirects=True, timeout=FETCH_TIMEOUT) as client:
-                resp = await client.get(req.url, headers={"User-Agent": USER_AGENT})
-                resp.raise_for_status()
-                html = resp.text[:MAX_CONTENT_LENGTH]
-                final_url = str(resp.url)
-        except httpx.HTTPStatusError as e:
-            return JSONResponse(status_code=502, content={"error": f"HTTP {e.response.status_code}", "url": req.url})
+            html, status, final_url = await safe_get(req.url, {"User-Agent": USER_AGENT})
         except Exception as e:
-            return JSONResponse(status_code=502, content={"error": str(e), "url": req.url})
+            return _fetch_error_response(e, req.url)
 
         cleaned = trafilatura.extract(html, include_links=False, include_tables=True)
         if not cleaned:
@@ -832,7 +883,7 @@ async def verify(req: VerifyRequest):
         _cache[ckey] = {
             "url": req.url,
             "final_url": final_url,
-            "status": 200,
+            "status": status,
             "mode": "clean",
             "from_cache": False,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
@@ -1055,19 +1106,21 @@ async def recall(req: RecallRequest):
     if not results_raw:
         return {"results": [], "query": req.query, "searched": vec_index.size}
 
-    # Fetch content for matched IDs
+    # Fetch content for matched IDs in one query (top_k is capped at 100).
     db = await get_db()
+    ids = [cid for cid, _ in results_raw]
+    rows = await db.execute_fetchall(
+        f"SELECT id, content, source FROM chunks WHERE id IN ({','.join('?' * len(ids))})", ids
+    )
+    by_id = {r[0]: r for r in rows}
     results = []
     for chunk_id, similarity in results_raw:
-        row = await db.execute(
-            "SELECT content, source FROM chunks WHERE id = ?", (chunk_id,)
-        )
-        data = await row.fetchone()
+        data = by_id.get(chunk_id)
         if data:
             results.append({
                 "id": chunk_id,
-                "content": data[0],
-                "source": data[1],
+                "content": data[1],
+                "source": data[2],
                 "similarity": round(similarity, 4)
             })
 
@@ -1154,16 +1207,35 @@ async def reindex():
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    # OpenAI clients send either a string or a list of content parts
+    # ([{"type": "text", "text": ...}, {"type": "image_url", ...}]).
+    content: Union[str, List[dict], None] = None
+
+    def text(self) -> str:
+        if isinstance(self.content, str):
+            return self.content
+        if not self.content:
+            return ""
+        return "\n".join(
+            p.get("text", "") for p in self.content
+            if isinstance(p, dict) and p.get("type") == "text"
+        )
+
+
+DEFAULT_MAX_TOKENS = 512
 
 
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None              # ignored; we serve the loaded model
     messages: List[ChatMessage]
-    max_tokens: int = 512
+    max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None   # current OpenAI field name
     temperature: float = 0.7
     top_p: float = 0.95
     stream: bool = False
+
+    def effective_max_tokens(self) -> int:
+        return self.max_completion_tokens or self.max_tokens or DEFAULT_MAX_TOKENS
 
 
 async def _ensure_llm_loaded():
@@ -1209,12 +1281,13 @@ async def chat_completions(req: ChatCompletionRequest):
     """OpenAI-compatible chat completions endpoint, MLX-backed."""
     await _ensure_llm_loaded()
     from backends import mlx_backend
-    messages = [m.model_dump() for m in req.messages]
+    messages = [{"role": m.role, "content": m.text()} for m in req.messages]
+    max_tokens = req.effective_max_tokens()
 
     if not req.stream:
         return await mlx_backend.generate_chat(
             messages=messages,
-            max_tokens=req.max_tokens,
+            max_tokens=max_tokens,
             temperature=req.temperature,
             top_p=req.top_p,
         )
@@ -1225,13 +1298,22 @@ async def chat_completions(req: ChatCompletionRequest):
     async def event_stream():
         completion_id = f"cloxy-{int(time.time() * 1000)}"
         model_id = mlx_backend.current_model() or "unknown"
+        finish_reason = "stop"
+        usage = None
 
-        async for fragment in mlx_backend.stream_chat(
+        # If the client disconnects, Starlette closes this generator, which
+        # closes stream_chat, which signals the MLX producer thread to stop.
+        async for piece in mlx_backend.stream_chat(
             messages=messages,
-            max_tokens=req.max_tokens,
+            max_tokens=max_tokens,
             temperature=req.temperature,
             top_p=req.top_p,
         ):
+            if piece.finish_reason:
+                finish_reason = piece.finish_reason
+                usage = piece.usage
+            if not piece.text:
+                continue
             chunk = {
                 "id": completion_id,
                 "object": "chat.completion.chunk",
@@ -1239,20 +1321,22 @@ async def chat_completions(req: ChatCompletionRequest):
                 "model": model_id,
                 "choices": [{
                     "index": 0,
-                    "delta": {"content": fragment},
+                    "delta": {"content": piece.text},
                     "finish_reason": None,
                 }],
             }
             yield f"data: {json.dumps(chunk)}\n\n"
 
-        # Final chunk + DONE sentinel
+        # Final chunk (real finish_reason + usage) and the DONE sentinel
         final = {
             "id": completion_id,
             "object": "chat.completion.chunk",
             "created": int(time.time()),
             "model": model_id,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
         }
+        if usage:
+            final["usage"] = usage
         yield f"data: {json.dumps(final)}\n\n"
         yield "data: [DONE]\n\n"
 

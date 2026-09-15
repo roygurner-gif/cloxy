@@ -45,6 +45,51 @@ def test_content_hash_is_stable_and_distinct():
     assert cloxy.content_hash("abc") != cloxy.content_hash("abd")
 
 
+def test_cache_key_includes_selector_and_headers():
+    base = cloxy.cache_key("https://a.example", "extract")
+    assert cloxy.cache_key("https://a.example", "extract", "h1") != base
+    assert cloxy.cache_key("https://a.example", "extract", "h1") != \
+        cloxy.cache_key("https://a.example", "extract", "h2")
+    assert cloxy.cache_key("https://a.example", "clean", None, {"Cookie": "a"}) != \
+        cloxy.cache_key("https://a.example", "clean")
+    # header order doesn't matter
+    assert cloxy.cache_key("https://a.example", "clean", None, {"A": "1", "B": "2"}) == \
+        cloxy.cache_key("https://a.example", "clean", None, {"B": "2", "A": "1"})
+
+
+def test_embedding_pack_unpack_roundtrip():
+    vec = np.arange(8, dtype=np.float32) / 3
+    out = cloxy.unpack_embedding(cloxy.pack_embedding(vec))
+    assert out.dtype == np.float32 and np.array_equal(out, vec)
+    # byte-compatible with the pre-4.1 struct layout
+    import struct
+    assert cloxy.pack_embedding(vec) == struct.pack("8f", *vec)
+
+
+# ---------------------------------------------------------------------------
+# chat request shapes
+# ---------------------------------------------------------------------------
+
+def test_chat_message_text_flattens_parts():
+    m = cloxy.ChatMessage(role="user", content="plain")
+    assert m.text() == "plain"
+    m = cloxy.ChatMessage(role="user", content=[
+        {"type": "text", "text": "one"},
+        {"type": "image_url", "image_url": {"url": "data:..."}},
+        {"type": "text", "text": "two"},
+    ])
+    assert m.text() == "one\ntwo"
+    assert cloxy.ChatMessage(role="assistant", content=None).text() == ""
+
+
+def test_effective_max_tokens_prefers_new_field():
+    msgs = [{"role": "user", "content": "x"}]
+    assert cloxy.ChatCompletionRequest(messages=msgs).effective_max_tokens() == cloxy.DEFAULT_MAX_TOKENS
+    assert cloxy.ChatCompletionRequest(messages=msgs, max_tokens=64).effective_max_tokens() == 64
+    assert cloxy.ChatCompletionRequest(messages=msgs, max_tokens=64,
+                                       max_completion_tokens=128).effective_max_tokens() == 128
+
+
 # ---------------------------------------------------------------------------
 # vector index
 # ---------------------------------------------------------------------------
