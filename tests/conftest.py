@@ -73,6 +73,7 @@ def client(tmp_path_factory):
     mp.setattr(config, "DATA_DIR", str(data_dir))
     mp.setattr(config, "DB_PATH", str(data_dir / "memory.db"))
     mp.setattr(config, "CONFIG_PATH", data_dir / "no-llm.json")
+    mp.setattr(config, "API_KEY", "")        # the dev box may have ~/.cloxy/client.env
     mp.setattr(config, "WATCH", False)
     mp.setattr(config, "ALLOW_PRIVATE_URLS", False)
     mp.setattr(config, "RERANK", False)
