@@ -65,7 +65,7 @@ One install. Your hardware. Your AI.
 ## Requirements
 
 - **Apple Silicon Mac** (M1, M2, M3, M4 or later) running macOS 13+
-- **Python 3.10+**
+- **Python 3.11+** (numpy 2.4 floor)
 - Enough unified memory for the model you want (see the catalog below)
 
 The **local LLM** is currently Apple Silicon only. The **web proxy + RAG memory** run anywhere Python does — install `requirements-core.txt` and use Cloxy as a proxy/memory backend for an external LLM. Cross-platform local inference (Linux / Windows via `llama-cpp-python`) is on the roadmap as a separate release.
@@ -362,7 +362,7 @@ Everything runs locally. No external APIs. No telemetry. No cloud. The LLM, the 
 
 ## Stack
 
-- Python 3.10+ / FastAPI / uvicorn
+- Python 3.11+ / FastAPI / uvicorn
 - **MLX / mlx-lm** for LLM inference (Apple Silicon native)
 - httpx / trafilatura / BeautifulSoup / markdownify
 - fastembed (BAAI/bge-small-en-v1.5) / numpy / aiosqlite
