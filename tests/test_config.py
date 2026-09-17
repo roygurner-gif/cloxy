@@ -28,3 +28,10 @@ def test_env_file_sets_defaults_only(tmp_path, monkeypatch):
 
 def test_env_file_missing_is_fine(tmp_path):
     config._load_env_file(str(tmp_path / "nope.env"))
+
+
+def test_embed_prefixes_follow_model_family():
+    assert config.default_embed_prefixes("intfloat/multilingual-e5-large") == ("query: ", "passage: ")
+    assert config.default_embed_prefixes("intfloat/e5-base-v2") == ("query: ", "passage: ")
+    assert config.default_embed_prefixes("BAAI/bge-small-en-v1.5") == ("", "")
+    assert config.default_embed_prefixes("sentence-transformers/all-MiniLM-L6-v2") == ("", "")

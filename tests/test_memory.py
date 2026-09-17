@@ -3,7 +3,7 @@ import struct
 
 import numpy as np
 
-from cloxy import memory
+from cloxy import config, memory
 
 
 # ---------------------------------------------------------------------------
@@ -107,3 +107,102 @@ def test_recency_decays_with_age():
     assert fresh > 0.99 and abs(month - 0.5) < 0.01 and old < 0.01
     assert memory._recency(None, now) == 0.5
     assert memory._recency("not a date", now) == 0.5
+
+
+# ---------------------------------------------------------------------------
+# embedding prefixes + meta check + reembed
+# ---------------------------------------------------------------------------
+
+def test_query_and_passage_prefixes_are_applied(monkeypatch):
+    seen = []
+
+    class Spy:
+        def embed(self, texts):
+            for t in texts:
+                seen.append(t)
+                yield np.ones(4, dtype=np.float32)
+
+    monkeypatch.setattr(memory, "embedder", Spy())
+    monkeypatch.setattr(config, "EMBED_QUERY_PREFIX", "query: ")
+    monkeypatch.setattr(config, "EMBED_PASSAGE_PREFIX", "passage: ")
+    memory.embed_query("boat plan")
+    memory.embed_passages(["a", "b"])
+    memory.embed_text("raw")            # symmetric use (/verify) stays untouched
+    assert seen == ["query: boat plan", "passage: a", "passage: b", "raw"]
+
+
+def test_embed_meta_problem_cases(monkeypatch):
+    monkeypatch.setattr(config, "EMBED_MODEL", "m")
+    monkeypatch.setattr(config, "EMBED_DIM", 4)
+    monkeypatch.setattr(config, "EMBED_PASSAGE_PREFIX", "passage: ")
+    ok = {"embed_model": "m", "embed_dim": "4", "embed_passage_prefix": "passage: "}
+    assert memory.embed_meta_problem({}, has_data=True) is None          # pre-v4 DB: adopt
+    assert memory.embed_meta_problem(ok, has_data=True) is None
+    assert "reembed" in memory.embed_meta_problem({**ok, "embed_model": "other"}, True)
+    assert "reembed" in memory.embed_meta_problem({**ok, "embed_dim": "8"}, True)
+    # A pre-5.1 DB never recorded a prefix: with data its vectors are raw text.
+    legacy = {"embed_model": "m", "embed_dim": "4"}
+    assert "passage" in memory.embed_meta_problem(legacy, has_data=True)
+    assert memory.embed_meta_problem(legacy, has_data=False) is None
+    monkeypatch.setattr(config, "EMBED_PASSAGE_PREFIX", "")
+    assert memory.embed_meta_problem(legacy, has_data=True) is None
+
+
+def test_reembed_round_trip(tmp_path, monkeypatch):
+    """Store raw → switch to a prefix → startup refuses → reembed → startup OK, vectors changed."""
+    import asyncio
+    import pytest
+    from conftest import FakeEmbedder
+
+    monkeypatch.setattr(config, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "memory.db"))
+    monkeypatch.setattr(config, "EMBED_QUERY_PREFIX", "")
+    monkeypatch.setattr(config, "EMBED_PASSAGE_PREFIX", "")
+    monkeypatch.setattr(memory, "embedder", FakeEmbedder())
+
+    async def blobs_and_meta():
+        rows = await memory.db.execute_fetchall("SELECT embedding FROM chunks ORDER BY id")
+        meta = {r[0]: r[1] for r in await memory.db.execute_fetchall("SELECT key, value FROM meta")}
+        return [r[0] for r in rows], meta
+
+    async def build():
+        await memory.init_db()
+        res = await memory.store_chunks([memory.ChunkIn(text="the boat plan is paused", source="t"),
+                                         memory.ChunkIn(text="power failure in the lab", source="t")])
+        assert res.stored == 2
+        out = await blobs_and_meta()
+        await memory.close_db()
+        return out
+    before, meta = asyncio.run(build())
+    assert meta["embed_passage_prefix"] == ""
+    assert memory.preflight_embed_check() is None
+
+    monkeypatch.setattr(config, "EMBED_PASSAGE_PREFIX", "passage: ")
+    assert "reembed" in memory.preflight_embed_check()
+
+    async def refused():
+        try:
+            await memory.init_db()
+        finally:
+            await memory.close_db()
+    with pytest.raises(RuntimeError, match="reembed"):
+        asyncio.run(refused())
+
+    async def fix():
+        await memory.init_db(check_embed=False)
+        seen = []
+        n = await memory.reembed(batch_size=1, progress=lambda d, t: seen.append((d, t)))
+        out = await blobs_and_meta()
+        await memory.close_db()
+        return n, seen, out
+    n, seen, (after, meta) = asyncio.run(fix())
+    assert n == 2 and seen == [(1, 2), (2, 2)]
+    assert meta["embed_passage_prefix"] == "passage: "
+    assert all(a != b for a, b in zip(after, before))
+    assert memory.vec_index.size == 2
+    assert memory.preflight_embed_check() is None
+
+    async def starts():
+        await memory.init_db()
+        await memory.close_db()
+    asyncio.run(starts())

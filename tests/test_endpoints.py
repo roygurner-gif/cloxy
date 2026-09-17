@@ -189,3 +189,29 @@ def test_memory_block_formatting():
     ])
     assert "1. [2026-09-10 · cloxy] we chose WAL mode" in block
     assert block.endswith(" …") and len(block) < 1600
+
+
+# ---------------------------------------------------------------------------
+# embedding prefixes on the write and read paths
+# ---------------------------------------------------------------------------
+
+def test_ingest_and_recall_use_passage_and_query_prefixes(client, monkeypatch):
+    real = memory.embedder
+    seen = []
+
+    class Spy:
+        def embed(self, texts):
+            texts = list(texts)
+            seen.extend(texts)
+            yield from real.embed(texts)
+
+    monkeypatch.setattr(memory, "embedder", Spy())
+    monkeypatch.setattr(config, "EMBED_QUERY_PREFIX", "query: ")
+    monkeypatch.setattr(config, "EMBED_PASSAGE_PREFIX", "passage: ")
+
+    r = client.post("/ingest_text", json={"text": "prefix probe alpha", "source": "prefix-test"})
+    assert r.status_code == 200
+    r = client.post("/recall", json={"query": "prefix probe", "mode": "dense", "top_k": 1})
+    assert r.status_code == 200
+    assert seen[0].startswith("passage: ") and "prefix probe alpha" in seen[0]
+    assert seen[-1] == "query: prefix probe"

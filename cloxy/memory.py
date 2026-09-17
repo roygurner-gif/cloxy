@@ -170,6 +170,25 @@ async def aembed_batch(texts: List[str]) -> List[np.ndarray]:
     return await asyncio.to_thread(embed_batch, texts)
 
 
+# Retrieval is asymmetric: a short question against long stored text. Models
+# trained that way (E5) want a role prefix on each side; see config.
+def embed_query(text: str) -> np.ndarray:
+    return embed_text(config.EMBED_QUERY_PREFIX + text)
+
+
+def embed_passages(texts: List[str]) -> List[np.ndarray]:
+    prefix = config.EMBED_PASSAGE_PREFIX
+    return embed_batch([prefix + t for t in texts])
+
+
+async def aembed_query(text: str) -> np.ndarray:
+    return await asyncio.to_thread(embed_query, text)
+
+
+async def aembed_passages(texts: List[str]) -> List[np.ndarray]:
+    return await asyncio.to_thread(embed_passages, texts)
+
+
 def pack_embedding(vec: np.ndarray) -> bytes:
     # Native-endian float32, byte-identical to the pre-4.1 struct.pack("Nf") layout.
     return np.asarray(vec, dtype=np.float32).tobytes()
@@ -283,8 +302,11 @@ END;
 """
 
 
-async def init_db():
-    """Open the database, create/migrate the schema, and enforce embed metadata."""
+async def init_db(check_embed: bool = True):
+    """
+    Open the database, create/migrate the schema, and enforce embed metadata.
+    `check_embed=False` is for `cloxy reembed`, whose job is to fix a mismatch.
+    """
     global db
     import os
     os.makedirs(config.DATA_DIR, exist_ok=True)
@@ -294,7 +316,8 @@ async def init_db():
     await db.executescript(SCHEMA)
     await _migrate()
     await db.commit()
-    await _check_embed_meta()
+    if check_embed:
+        await _check_embed_meta()
     logger.info(f"Database ready at {config.DB_PATH}")
 
 
@@ -316,33 +339,63 @@ async def _migrate():
         logger.info("Built FTS5 keyword index from existing memories")
 
 
+EMBED_META_KEYS = ("embed_model", "embed_dim", "embed_passage_prefix")
+
+
+def embed_meta_problem(stored: dict, has_data: bool) -> Optional[str]:
+    """
+    Compare the DB's recorded embedding setup with the configured one.
+    Returns a message if the stored vectors can't be searched with the
+    current settings, else None. Pure, so the sync preflight and the async
+    startup path can't drift apart.
+    """
+    model, dim = stored.get("embed_model"), stored.get("embed_dim")
+    if model is None:
+        return None  # fresh or pre-v4 DB: adopt the current settings
+    if model != config.EMBED_MODEL or dim != str(config.EMBED_DIM):
+        return (f"DB was built with {model} (dim {dim}) but CLOXY_EMBED_MODEL="
+                f"{config.EMBED_MODEL} (dim {config.EMBED_DIM}). Run `cloxy reembed` "
+                f"with the server stopped to re-embed every memory with the new model, "
+                f"or use the original model.")
+    prefix = stored.get("embed_passage_prefix")
+    if prefix is None:
+        # Older DB that never recorded a prefix: its vectors are raw text.
+        prefix = "" if has_data else config.EMBED_PASSAGE_PREFIX
+    if prefix != config.EMBED_PASSAGE_PREFIX:
+        return (f"stored memories were embedded with passage prefix {prefix!r} but the "
+                f"current setting is {config.EMBED_PASSAGE_PREFIX!r}. Run `cloxy reembed` "
+                f"with the server stopped, or set CLOXY_EMBED_PASSAGE_PREFIX={prefix!r}.")
+    return None
+
+
+async def _write_embed_meta():
+    for key, value in (("embed_model", config.EMBED_MODEL),
+                       ("embed_dim", str(config.EMBED_DIM)),
+                       ("embed_passage_prefix", config.EMBED_PASSAGE_PREFIX)):
+        await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+    await db.commit()
+
+
 async def _check_embed_meta():
     """
-    Record the embedding model + dim in the DB the first time, and refuse to
-    start if a later run points at a different model/dim than the stored data.
+    Record the embedding model, dim and passage prefix in the DB the first
+    time, and refuse to start if a later run can't search the stored vectors.
     """
     rows = {r[0]: r[1] for r in await db.execute_fetchall("SELECT key, value FROM meta")}
-    stored_model = rows.get("embed_model")
-    stored_dim = rows.get("embed_dim")
     has_data = (await db.execute_fetchall("SELECT 1 FROM chunks LIMIT 1")) != []
 
-    if stored_model is None:
+    problem = embed_meta_problem(rows, has_data)
+    if problem:
+        raise RuntimeError(f"Embedding mismatch: {problem}")
+
+    if rows.get("embed_model") is None:
         if has_data:
             logger.warning("No embed metadata in DB; assuming current model. "
-                           "If recall looks wrong, re-ingest with a clean DB.")
-        await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-                         ("embed_model", config.EMBED_MODEL))
-        await db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)",
-                         ("embed_dim", str(config.EMBED_DIM)))
-        await db.commit()
-        return
-
-    if stored_model != config.EMBED_MODEL or stored_dim != str(config.EMBED_DIM):
-        raise RuntimeError(
-            f"Embedding mismatch: DB was built with {stored_model} (dim {stored_dim}) "
-            f"but CLOXY_EMBED_MODEL={config.EMBED_MODEL} (dim {config.EMBED_DIM}). "
-            f"Use the original model, or start with a fresh CLOXY_DATA_DIR."
-        )
+                           "If recall looks wrong, run `cloxy reembed`.")
+        await _write_embed_meta()
+    elif rows.get("embed_passage_prefix") is None:
+        # Passed the check, so the missing key equals the current prefix; record it.
+        await _write_embed_meta()
 
 
 def preflight_embed_check() -> Optional[str]:
@@ -358,15 +411,12 @@ def preflight_embed_check() -> Optional[str]:
     try:
         conn = sqlite3.connect(config.DB_PATH)
         rows = {k: v for k, v in conn.execute("SELECT key, value FROM meta").fetchall()}
+        has_data = conn.execute("SELECT 1 FROM chunks LIMIT 1").fetchone() is not None
         conn.close()
     except sqlite3.Error:
         return None  # pre-v4 DB without a meta table; the lifespan path handles it
-    stored_model, stored_dim = rows.get("embed_model"), rows.get("embed_dim")
-    if stored_model and (stored_model != config.EMBED_MODEL or stored_dim != str(config.EMBED_DIM)):
-        return (f"embedding mismatch: DB was built with {stored_model} (dim {stored_dim}) "
-                f"but you configured {config.EMBED_MODEL} (dim {config.EMBED_DIM}). "
-                f"Use the original model, or start with a fresh CLOXY_DATA_DIR.")
-    return None
+    problem = embed_meta_problem(rows, has_data)
+    return f"embedding mismatch: {problem}" if problem else None
 
 
 async def load_vector_index():
@@ -374,6 +424,29 @@ async def load_vector_index():
         "SELECT id, embedding FROM chunks WHERE embedding IS NOT NULL")
     vec_index.load([r[0] for r in rows], [unpack_embedding(r[1]) for r in rows])
     logger.info(f"Vector index: loaded {len(rows)} embeddings into memory")
+
+
+async def reembed(batch_size: int = 64, progress=None) -> int:
+    """
+    Re-embed every memory with the current model + passage prefix, then
+    record that setup in `meta`. Commits per batch, so an interrupted run
+    leaves the meta untouched and is simply rerun. Returns the chunk count.
+    """
+    rows = await db.execute_fetchall("SELECT id, content FROM chunks ORDER BY id")
+    total, done = len(rows), 0
+    for i in range(0, total, batch_size):
+        window = rows[i:i + batch_size]
+        embs = await aembed_passages([r[1] for r in window])
+        await db.executemany(
+            "UPDATE chunks SET embedding = ? WHERE id = ?",
+            [(pack_embedding(e), r[0]) for r, e in zip(window, embs)])
+        await db.commit()
+        done += len(window)
+        if progress:
+            progress(done, total)
+    await _write_embed_meta()
+    await load_vector_index()
+    return total
 
 
 async def close_db():
@@ -444,7 +517,7 @@ async def store_chunks(items: List[ChunkIn]) -> StoreResult:
     if not new:
         return result
 
-    embeddings = await aembed_batch([item.text for item, _ in new])
+    embeddings = await aembed_passages([item.text for item, _ in new])
     new_embs = []
     for (item, h), emb in zip(new, embeddings):
         cursor = await db.execute(
@@ -569,7 +642,7 @@ async def search(query: str, top_k: int = 5, mode: str = "hybrid",
 
     dense: List[tuple] = []
     if mode in ("hybrid", "dense") and vec_index.size:
-        qemb = await aembed_text(query)
+        qemb = await aembed_query(query)
         dense = vec_index.search(qemb, top_k=pool, allowed_ids=allowed)
 
     keyword: List[tuple] = []
