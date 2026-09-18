@@ -78,6 +78,7 @@ To feed that server this machine's Claude Code sessions, mirror them into one of
 - **Incremental.** Each session file is tracked by byte offset. Only new lines are read. The last, still-growing chunk is stored so it's searchable immediately and replaced on the next pass.
 - **Dated and scoped.** Every memory carries the session's working directory (project), timestamps, git branch, and title. Filter with `project`, `since`, `until`.
 - **Hybrid.** Dense vectors catch meaning; FTS5 catches the exact port number, hostname, or flag that embeddings blur. Results are fused and gently tilted toward recent memories (30-day half-life; `recency_weight` 0–1). The `score` on each hit is the fused rank value (typically 0.01–0.04), so compare hits within one query by order, not by magnitude — it is not a cosine similarity like `/verify` reports.
+- **Asymmetric embeddings.** A short question is embedded differently from the long text it searches. Models trained that way (the E5 family) get their `query: ` / `passage: ` prefixes automatically; fastembed does not add them, and without them E5 recall drops sharply. Override with `CLOXY_EMBED_QUERY_PREFIX` / `CLOXY_EMBED_PASSAGE_PREFIX`.
 - **Optional reranker.** `CLOXY_RERANK=1` runs a small cross-encoder over the top 20.
 - **Self-cleaning.** Delete one memory, a whole source, or force a re-ingest; the vector and keyword indexes stay in sync.
 
@@ -160,6 +161,7 @@ cloxy mcp                           MCP stdio server (for editors)
 cloxy recall QUERY [-k N] [--project P] [--since D] [--until D] [--mode M] [--full] [--json]
 cloxy ingest [DIR] [--force]        run an ingest pass now
 cloxy status                        health, memory, watcher
+cloxy reembed                       re-embed every memory (after changing model/prefix; server stopped)
 cloxy install-service | uninstall-service   launchd (macOS)
 cloxy init | show | list            local LLM setup
 ```
@@ -179,8 +181,10 @@ Everything is an environment variable.
 | `CLOXY_WATCH` | `1` | Run the conversation watcher |
 | `CLOXY_WATCH_DIRS` | `~/.claude/projects` | Directories to watch (`:`-separated) |
 | `CLOXY_WATCH_INTERVAL` | `5` | Seconds between scans |
-| `CLOXY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (recorded in the DB; changing it needs a fresh data dir) |
+| `CLOXY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (recorded in the DB; change it, then `cloxy reembed`) |
 | `CLOXY_EMBED_DIM` | `384` | Must match the model |
+| `CLOXY_EMBED_QUERY_PREFIX` | by model | Prepended to every query before embedding (`query: ` for E5, empty otherwise) |
+| `CLOXY_EMBED_PASSAGE_PREFIX` | by model | Prepended to stored text before embedding (`passage: ` for E5). Recorded in the DB; change it, then `cloxy reembed` |
 | `CLOXY_RERANK` | *(unset)* | `1` to rerank the top 20 with a cross-encoder |
 | `CLOXY_RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Reranker |
 | `CLOXY_CHAT_MEMORY` | *(unset)* | `1` to inject memory into every chat completion by default |
@@ -221,7 +225,9 @@ The suite (no network, no models) covers the SSRF guard and redirect walking, ca
 
 **Does it work offline?** Yes. Memory, recall, and the local LLM are offline once models are downloaded. `/fetch` needs the network.
 
-**What if I change the embedding model?** Cloxy refuses to start against a database built with a different model or dimension. Point `CLOXY_DATA_DIR` at a fresh directory and let the watcher rebuild.
+**What if I change the embedding model?** Cloxy refuses to start against a database built with a different model, dimension, or passage prefix, and tells you why. Stop the server, run `cloxy reembed` with the new settings (every memory is re-embedded in place; a few minutes per few thousand chunks on Apple Silicon), then start it again.
+
+**I was already on an E5 model before v5.1.** Your memories were embedded without the `passage: ` prefix, so the first start after upgrading refuses with a prefix mismatch. `cloxy reembed` fixes it once; to keep the old behaviour instead, set `CLOXY_EMBED_PASSAGE_PREFIX=` and `CLOXY_EMBED_QUERY_PREFIX=` (both empty).
 
 **Can I use a model not in the catalog?** `cloxy init` → Custom → any Hugging Face MLX id (usually `mlx-community/...`).
 

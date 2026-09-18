@@ -266,6 +266,41 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_reembed(args: argparse.Namespace) -> int:
+    """
+    Offline: re-embed every memory with the configured model and prefix.
+    The server owns the DB and the index while it runs, so it must be stopped.
+    """
+    import asyncio
+    import httpx
+    from . import memory
+    try:
+        with _http() as c:
+            c.get("/health")
+        running = True
+    except httpx.ConnectError:
+        running = False
+    if running:
+        print(f"Cloxy is running at {config.URL}. Stop it first (`launchctl bootout "
+              f"gui/$UID/com.cloxy.server`, or Ctrl-C the `cloxy start`), then rerun.")
+        return 1
+
+    async def run() -> int:
+        await memory.init_db(check_embed=False)
+        memory.init_embedder()
+        try:
+            return await memory.reembed(
+                progress=lambda done, total: print(f"\r  {done}/{total}", end="", flush=True))
+        finally:
+            await memory.close_db()
+
+    print(f"Re-embedding {config.DB_PATH} with {config.EMBED_MODEL} "
+          f"(passage prefix {config.EMBED_PASSAGE_PREFIX!r}) ...")
+    n = asyncio.run(run())
+    print(f"\nDone: {n} memories. Start the server again.")
+    return 0
+
+
 # =============================================================================
 # launchd service (macOS)
 # =============================================================================
@@ -374,6 +409,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("dir", nargs="?", help="directory of .jsonl sessions (default: watched dirs)")
     p.add_argument("--force", action="store_true", help="re-ingest from scratch")
     p.set_defaults(func=cmd_ingest)
+
+    sub.add_parser("reembed", help="Re-embed all memories after changing the embedding "
+                   "model or prefix (server stopped)").set_defaults(func=cmd_reembed)
 
     sub.add_parser("install-service", help="Run cloxy at login via launchd (macOS)") \
         .set_defaults(func=cmd_install_service)

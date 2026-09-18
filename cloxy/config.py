@@ -64,6 +64,24 @@ ALLOW_PRIVATE_URLS = _flag("CLOXY_ALLOW_PRIVATE_URLS")
 # --- Memory ---
 EMBED_MODEL = os.environ.get("CLOXY_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
 EMBED_DIM = int(os.environ.get("CLOXY_EMBED_DIM", 384))
+
+
+def default_embed_prefixes(model: str) -> tuple:
+    """
+    (query prefix, passage prefix) the model was trained with. E5 models
+    expect "query: " / "passage: " and measurably lose recall without them
+    (fastembed does not add them); BGE and most others take raw text.
+    """
+    name = model.rsplit("/", 1)[-1].lower()
+    if name.startswith("e5-") or "-e5-" in name or name.startswith("multilingual-e5"):
+        return ("query: ", "passage: ")
+    return ("", "")
+
+
+_QUERY_PREFIX, _PASSAGE_PREFIX = default_embed_prefixes(EMBED_MODEL)
+EMBED_QUERY_PREFIX = os.environ.get("CLOXY_EMBED_QUERY_PREFIX", _QUERY_PREFIX)
+# Recorded in the DB like the model; changing it means `cloxy reembed`.
+EMBED_PASSAGE_PREFIX = os.environ.get("CLOXY_EMBED_PASSAGE_PREFIX", _PASSAGE_PREFIX)
 CHUNK_SIZE = 1500
 CHUNK_OVERLAP = 200
 MAX_INGEST_CHARS = 2_000_000      # cap on a single /ingest_text payload

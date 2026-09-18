@@ -9,7 +9,7 @@ def test_parser_has_all_commands():
     p = cli.build_parser()
     cmds = p._subparsers._group_actions[0].choices
     assert {"init", "show", "list", "start", "mcp", "status", "recall", "ingest",
-            "install-service", "uninstall-service"} <= set(cmds)
+            "reembed", "install-service", "uninstall-service"} <= set(cmds)
 
 
 def test_service_plist_uses_console_script_and_data_dir(monkeypatch, tmp_path):

@@ -1,5 +1,18 @@
 # Changelog
 
+## v5.1 — E5 prefixes and `cloxy reembed`
+
+- **Query/passage prefixes.** E5-family embedding models are trained with
+  `query: ` / `passage: ` prefixes and lose a lot of recall without them;
+  fastembed does not add them. Cloxy now picks the prefixes from the model
+  name (`CLOXY_EMBED_QUERY_PREFIX` / `CLOXY_EMBED_PASSAGE_PREFIX` override),
+  embeds queries and stored text accordingly, and records the passage prefix
+  in the DB next to the model and dim.
+- **`cloxy reembed`.** Re-embeds every memory in place with the configured
+  model and prefix, then records that setup. This is now the way to change
+  embedding models, and the one-time fix for an E5 database built before
+  this release (the server refuses to start until it runs).
+
 ## v5.0 — memory that keeps itself
 
 - **Live ingest.** A watcher follows `~/.claude/projects` and ingests new
