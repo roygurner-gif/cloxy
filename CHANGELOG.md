@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **On PyPI.** `pipx install cloxy`. Releases publish from a `v*` tag via
+  GitHub trusted publishing (`.github/workflows/release.yml`); the tag must
+  match `cloxy.__version__`.
+
 ## v5.1 — E5 prefixes and `cloxy reembed`
 
 - **Query/passage prefixes.** E5-family embedding models are trained with
