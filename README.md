@@ -15,11 +15,13 @@ All of it is exposed as an **MCP server**, so Claude Code, Cursor, Continue, and
 Requires Python 3.11+. macOS (Apple Silicon) for the local LLM; the proxy, memory, and MCP server run anywhere.
 
 ```bash
-# from a clone
-pip install .            # proxy + memory + MCP
-pip install ".[mlx]"     # + Apple Silicon LLM
+pipx install cloxy             # proxy + memory + MCP
+pipx install "cloxy[mlx]"      # + Apple Silicon LLM
 
-# or straight from GitHub
+# or from a clone
+pip install ".[mlx]"
+
+# or the bleeding edge straight from GitHub
 pipx install "git+https://github.com/roygurner-gif/cloxy"
 ```
 
