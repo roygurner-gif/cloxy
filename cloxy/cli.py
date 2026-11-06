@@ -6,6 +6,7 @@ Cloxy CLI.
   cloxy mcp                run the MCP stdio server (for Claude Code, Cursor, ...)
   cloxy recall "query"     search memory from the shell
   cloxy ingest [DIR]       run an ingest pass now (the watcher does this live)
+  cloxy push               mirror this machine's agent sessions to CLOXY_URL
   cloxy status             health + memory + watcher summary
   cloxy install-service    keep the server running via launchd (macOS)
   cloxy uninstall-service
@@ -266,6 +267,49 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_push(args: argparse.Namespace) -> int:
+    import httpx
+    from . import push
+
+    if push.is_loopback_url(config.URL) and not args.force:
+        print(f"CLOXY_URL is {config.URL}: that server already watches this machine's "
+              "sessions.\nSet CLOXY_URL (and CLOXY_API_KEY) to the remote server in "
+              f"{config.DATA_DIR}/client.env, or pass --force.")
+        return 1
+    host = args.host or push.default_host()
+
+    def report(s: "push.PushSummary") -> None:
+        if s.files_pushed or s.errors or args.once:
+            print(f"push {host} → {config.URL}: {s.files_pushed}/{s.files_seen} files, "
+                  f"{s.bytes_sent:,} bytes" + (f", {s.resyncs} resyncs" if s.resyncs else ""),
+                  flush=True)
+        for e in s.errors[:10]:
+            print(f"  error {e}", flush=True)
+
+    with _http() as c:
+        def post(payload: dict):
+            r = c.post("/push", json=payload)
+            try:
+                return r.status_code, r.json()
+            except ValueError:
+                return r.status_code, {"error": r.text[:200]}
+        try:
+            c.get("/health")
+        except httpx.ConnectError:
+            return _not_running()
+        if args.once:
+            s = push.push_once(post, host)
+            report(s)
+            return 1 if s.errors else 0
+        print(f"Pushing {', '.join(f'{a}={d}' for a, d in config.PUSH_SOURCES)} "
+              f"to {config.URL} as '{host}' every {args.interval:g}s (Ctrl-C to stop)")
+        try:
+            push.run_loop(post, host, args.interval, report)
+        except KeyboardInterrupt:
+            return 0
+    return 0
+
+
 def cmd_reembed(args: argparse.Namespace) -> int:
     """
     Offline: re-embed every memory with the configured model and prefix.
@@ -409,6 +453,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("dir", nargs="?", help="directory of .jsonl sessions (default: watched dirs)")
     p.add_argument("--force", action="store_true", help="re-ingest from scratch")
     p.set_defaults(func=cmd_ingest)
+
+    p = sub.add_parser("push", help="Mirror this machine's agent sessions to a remote "
+                       "Cloxy server (CLOXY_URL)")
+    p.add_argument("--once", action="store_true", help="one pass, then exit (for cron)")
+    p.add_argument("--interval", type=float, default=config.PUSH_INTERVAL,
+                   help=f"seconds between passes (default {config.PUSH_INTERVAL:g})")
+    p.add_argument("--host", help="name for this machine on the server (default: hostname)")
+    p.add_argument("--force", action="store_true", help="push even to a loopback CLOXY_URL")
+    p.set_defaults(func=cmd_push)
 
     sub.add_parser("reembed", help="Re-embed all memories after changing the embedding "
                    "model or prefix (server stopped)").set_defaults(func=cmd_reembed)

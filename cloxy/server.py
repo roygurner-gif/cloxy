@@ -19,6 +19,7 @@ from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from . import __version__, config, memory, proxy
+from . import push as pushmod
 from .convos import ingester, watcher
 from .memory import ChunkIn
 
@@ -125,6 +126,15 @@ class RecallRequest(BaseModel):
     rerank: Optional[bool] = None        # default: CLOXY_RERANK
 
 
+class PushRequest(BaseModel):
+    host: str = Field(..., max_length=64)
+    agent: str = "claude"                # claude | codex
+    path: str = Field(..., max_length=1024)   # relative to the agent's session root
+    offset: int = Field(..., ge=0)       # byte offset the data starts at
+    data: str = Field("", max_length=config.PUSH_MAX_BYTES * 2)   # base64, whole lines
+    replace: bool = False                # rewrite the mirror from offset 0
+
+
 class DeleteBySourceRequest(BaseModel):
     source_prefix: str  # matches source LIKE 'prefix%' (e.g. "convo:" or "manual")
 
@@ -160,7 +170,8 @@ async def index():
   MEMORY:
     POST /recall         — Hybrid search (dense + keyword), filters, recency
     POST /ingest_text    — Store any text
-    POST /ingest_convos  — Ingest Claude Code sessions now (the watcher does this live)
+    POST /ingest_convos  — Ingest agent sessions now (the watcher does this live)
+    POST /push           — Receive session lines from `cloxy push` on another machine
     GET  /projects       — Projects seen in memory
     GET  /memory_stats   — Memory stats
     GET  /ingest_status  — Watcher status
@@ -326,6 +337,23 @@ async def ingest_convos(req: IngestConvoRequest):
     logger.info(f"INGEST_CONVOS dirs={dirs or config.WATCH_DIRS} force={req.force}")
     summary = await ingester.scan(dirs, force=req.force, settle=0)
     return summary.as_dict()
+
+
+@app.post("/push", dependencies=[Depends(check_auth)])
+async def push(req: PushRequest):
+    """Append session lines mirrored from another machine (see `cloxy push`)."""
+    try:
+        dest, size, rewritten = pushmod.apply_push(
+            req.host, req.agent, req.path, req.offset, req.data, req.replace)
+    except pushmod.PushError as e:
+        body = {"error": e.message}
+        if e.size is not None:
+            body["size"] = e.size
+        return JSONResponse(status_code=e.status, content=body)
+    if rewritten:
+        # The mirror no longer matches what was ingested from it: start that file over.
+        await ingester.ingest_file(str(dest), force=True)
+    return {"size": size}
 
 
 @app.post("/ingest_text", dependencies=[Depends(check_auth)])

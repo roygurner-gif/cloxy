@@ -4,7 +4,7 @@
 
 Cloxy is one process that gives any AI tool three things it doesn't have on its own:
 
-- **Memory that keeps itself.** Cloxy watches your Claude Code sessions and ingests them as they happen. Ask "what did we decide about the auth flow last week" and get the actual conversation back — dated, tagged with the project, ranked by a hybrid semantic + keyword search.
+- **Memory that keeps itself.** Cloxy watches your Claude Code and Codex sessions and ingests them as they happen — one memory shared by every agent you run, on every machine you run them on. Ask "what did we decide about the auth flow last week" and get the actual conversation back — dated, tagged with the project, ranked by a hybrid semantic + keyword search.
 - **Eyes.** A web proxy that turns any URL into clean text, markdown, or a CSS-selected extract, and a `/verify` endpoint that ranks a page's passages against a claim.
 - **A local LLM** (optional, Apple Silicon). `cloxy init` picks an MLX model that fits your unified memory; `/v1/chat/completions` serves it OpenAI-style — with your memory injected if you want.
 
@@ -28,7 +28,7 @@ pipx install "git+https://github.com/roygurner-gif/cloxy"
 ## Quick start
 
 ```bash
-cloxy start              # server on http://127.0.0.1:9055 — the watcher starts ingesting ~/.claude/projects
+cloxy start              # server on http://127.0.0.1:9055 — the watcher ingests ~/.claude/projects + ~/.codex/sessions
 cloxy status             # memories, watcher, index sizes
 cloxy recall "what port does the staging cluster use"
 ```
@@ -60,12 +60,21 @@ CLOXY_URL=http://192.168.1.20:9055
 CLOXY_API_KEY=…
 ```
 
-To feed that server this machine's Claude Code sessions, mirror them into one of its `CLOXY_WATCH_DIRS` (e.g. a `rsync -a ~/.claude/projects/ host:claude-sessions/$(hostname)/` on a timer).
+To feed that server this machine's agent sessions too, run `cloxy push` on the client:
+
+```bash
+cloxy push               # every 10s: send new session lines to CLOXY_URL
+cloxy push --once        # one pass (cron / a timer)
+```
+
+It sends only complete lines that are new since the last pass, tagged with the byte offset they start at, to `POST /push`. The server appends them to a mirror under `~/.cloxy/inbox/<host>/<agent>/` — refusing any slice that doesn't line up, and telling the client where to resume — and its watcher ingests the mirror like local sessions. Same API key as everything else; no ssh, no rsync. `--host` sets the name this machine appears under (default: its hostname).
 
 ## How memory works
 
 ```
-~/.claude/projects/**/*.jsonl  ──watcher (5s)──▶  parse new lines from last byte offset
+~/.claude/projects/**/*.jsonl  ─┐
+~/.codex/sessions/**/*.jsonl   ─┼─watcher (5s)──▶  parse new lines from last byte offset
+~/.cloxy/inbox/  (cloxy push)  ─┘
                                                        │
                                             pack whole messages into ~1500-char chunks
                                             header: [2026-09-12 14:40 · rmbr · Board colors]
@@ -78,6 +87,7 @@ To feed that server this machine's Claude Code sessions, mirror them into one of
 ```
 
 - **Incremental.** Each session file is tracked by byte offset. Only new lines are read. The last, still-growing chunk is stored so it's searchable immediately and replaced on the next pass.
+- **Every agent.** Claude Code and Codex CLI sessions are recognised per file (by name, else by the first line); harness plumbing — system reminders, Codex's environment/AGENTS.md preamble, tool calls, reasoning — is dropped, and each memory records which `agent` wrote it.
 - **Dated and scoped.** Every memory carries the session's working directory (project), timestamps, git branch, and title. Filter with `project`, `since`, `until`.
 - **Hybrid.** Dense vectors catch meaning; FTS5 catches the exact port number, hostname, or flag that embeddings blur. Results are fused and gently tilted toward recent memories (30-day half-life; `recency_weight` 0–1). The `score` on each hit is the fused rank value (typically 0.01–0.04), so compare hits within one query by order, not by magnitude — it is not a cosine similarity like `/verify` reports.
 - **Asymmetric embeddings.** A short question is embedded differently from the long text it searches. Models trained that way (the E5 family) get their `query: ` / `passage: ` prefixes automatically; fastembed does not add them, and without them E5 recall drops sharply. Override with `CLOXY_EMBED_QUERY_PREFIX` / `CLOXY_EMBED_PASSAGE_PREFIX`.
@@ -94,6 +104,7 @@ Existing v3/v4 databases migrate in place on first start.
 | `POST` | `/ingest_text` | Store any text. `{text, source, project?, metadata?}` |
 | `POST` | `/ingest_convos` | Run an ingest pass now. `{convo_dir?, force?}` |
 | `GET` | `/projects` | Projects present in memory with counts and date ranges |
+| `POST` | `/push` | Receive session lines from `cloxy push`. `{host, agent, path, offset, data (base64, whole lines), replace?}` → `{size}`; 409 + `{size}` if the offset doesn't match |
 | `GET` | `/ingest_status` | Watcher state |
 | `GET` | `/memory_stats` | Counts, sources, index sizes |
 | `DELETE` | `/memory/{id}` | Delete one memory |
@@ -162,6 +173,7 @@ cloxy start [--host H] [--port P]   run the server
 cloxy mcp                           MCP stdio server (for editors)
 cloxy recall QUERY [-k N] [--project P] [--since D] [--until D] [--mode M] [--full] [--json]
 cloxy ingest [DIR] [--force]        run an ingest pass now
+cloxy push [--once] [--interval S] [--host NAME]   mirror this machine's sessions to CLOXY_URL
 cloxy status                        health, memory, watcher
 cloxy reembed                       re-embed every memory (after changing model/prefix; server stopped)
 cloxy install-service | uninstall-service   launchd (macOS)
@@ -181,8 +193,10 @@ Everything is an environment variable.
 | `CLOXY_DATA_DIR` | `~/.cloxy` | Database, LLM config, logs, downloaded embedding models (`models/`) |
 | `FASTEMBED_CACHE_PATH` | `$CLOXY_DATA_DIR/models` | Where embedding/reranker models are cached (set explicitly to share an existing cache) |
 | `CLOXY_WATCH` | `1` | Run the conversation watcher |
-| `CLOXY_WATCH_DIRS` | `~/.claude/projects` | Directories to watch (`:`-separated) |
+| `CLOXY_WATCH_DIRS` | `~/.claude/projects:~/.codex/sessions` | Directories to watch (`:`-separated). `~/.cloxy/inbox` is always watched too |
 | `CLOXY_WATCH_INTERVAL` | `5` | Seconds between scans |
+| `CLOXY_PUSH_SOURCES` | `claude=~/.claude/projects,codex=~/.codex/sessions` | What `cloxy push` mirrors, as `agent=dir` pairs |
+| `CLOXY_PUSH_INTERVAL` | `10` | Seconds between `cloxy push` passes |
 | `CLOXY_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | Embedding model (recorded in the DB; change it, then `cloxy reembed`) |
 | `CLOXY_EMBED_DIM` | `384` | Must match the model |
 | `CLOXY_EMBED_QUERY_PREFIX` | by model | Prepended to every query before embedding (`query: ` for E5, empty otherwise) |
@@ -202,7 +216,8 @@ Everything is an environment variable.
 - **Loopback by default.** Nothing is reachable off your machine unless you set `CLOXY_HOST=0.0.0.0`.
 - **If you expose it, set an API key.** Otherwise anyone on the network can read and write your memory. The key is compared in constant time.
 - **SSRF guard.** `/fetch`, `/search`, `/verify` resolve the target and refuse private, loopback, link-local, and cloud-metadata addresses — and re-check every redirect hop (max 5). Bodies are streamed and cut at 500 KB; binary content types are refused.
-- **Your transcripts stay local.** The watcher reads `~/.claude/projects` on this machine and writes to `~/.cloxy/memory.db`. No telemetry. The only outbound traffic is `/fetch` requests you make and one-time model downloads.
+- **Your transcripts stay local.** The watcher reads the session directories on this machine and writes to `~/.cloxy/memory.db`. They leave it only if you run `cloxy push`, and then only to the `CLOXY_URL` you set. No telemetry.
+- **`/push` writes only inside the inbox.** Host, agent, and every path component are validated; anything that resolves outside `~/.cloxy/inbox` is refused. The only outbound traffic is `/fetch` requests you make and one-time model downloads.
 
 ## Docker (proxy + memory + MCP; no LLM, no watcher)
 

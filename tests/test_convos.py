@@ -149,3 +149,83 @@ def test_incremental_ingest_replaces_tail_and_keeps_metadata(client, tmp_path):
 
 def test_ingest_convos_bad_dir(client):
     assert client.post("/ingest_convos", json={"convo_dir": "/definitely/not/here"}).status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Codex rollouts
+# ---------------------------------------------------------------------------
+
+CODEX_ID = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b"
+CODEX_CWD = "/Users/someone/projects/diginom"
+
+
+def _codex(kind, payload, ts="2026-11-01T09:00:00Z"):
+    return _line(timestamp=ts, type=kind, payload=payload)
+
+
+def _codex_msg(role, text, ts, block="input_text"):
+    return _codex("response_item", {"type": "message", "role": role,
+                                    "content": [{"type": block, "text": text}]}, ts)
+
+
+def _codex_rollout() -> bytes:
+    return (
+        _codex("session_meta", {"id": CODEX_ID, "cwd": CODEX_CWD, "originator": "codex_cli_rs",
+                                "git": {"branch": "feature/mogi", "commit_hash": "abc"}})
+        + _codex_msg("developer", "You are Codex, follow the sandbox rules.", "2026-11-01T09:00:01Z")
+        + _codex_msg("user", "# AGENTS.md instructions for /x\n\n<INSTRUCTIONS>be nice</INSTRUCTIONS>",
+                     "2026-11-01T09:00:02Z")
+        + _codex_msg("user", "<environment_context>\n  <cwd>/x</cwd>\n</environment_context>",
+                     "2026-11-01T09:00:03Z")
+        + _codex("turn_context", {"cwd": CODEX_CWD, "model": "qwen3-coder"})
+        + _codex_msg("user", "translate the mogi listing titles", "2026-11-01T09:01:00Z")
+        + _codex("event_msg", {"type": "user_message", "message": "translate the mogi listing titles"})
+        + _codex("response_item", {"type": "reasoning", "summary": []})
+        + _codex("response_item", {"type": "function_call", "name": "shell", "arguments": "{}"})
+        + _codex_msg("assistant", "Done: titles now go through the Qwen pipeline.",
+                     "2026-11-01T09:02:00Z", block="output_text")
+    )
+
+
+def test_codex_rollout_parsing(tmp_path):
+    p = tmp_path / f"rollout-2026-11-01T09-00-00-{CODEX_ID}.jsonl"
+    p.write_bytes(_codex_rollout())
+    assert convos.detect_agent(str(p)) == "codex"
+    meta = convos.SessionMeta(session_id="from-filename")
+    msgs, meta, _ = convos.parse_messages(str(p), 0, meta)
+    assert [(m.role, m.text) for m in msgs] == [
+        ("user", "translate the mogi listing titles"),
+        ("assistant", "Done: titles now go through the Qwen pipeline.")]
+    assert meta.agent == "codex" and meta.session_id == CODEX_ID
+    assert meta.project == CODEX_CWD and meta.git_branch == "feature/mogi"
+    assert convos.render_group(msgs, meta).startswith(
+        f"[2026-11-01 09:01 · diginom · codex {CODEX_ID[:8]}]\nUSER: translate")
+
+
+def test_codex_detected_by_content_and_legacy_layout(tmp_path):
+    p = tmp_path / "renamed.jsonl"
+    p.write_bytes(_line(id=CODEX_ID, timestamp="2025-05-01T10:00:00Z", instructions="")
+                  + _line(type="message", role="user", content=[{"type": "input_text", "text": "old q"}])
+                  + _line(record_type="state")
+                  + _line(type="message", role="assistant",
+                          content=[{"type": "output_text", "text": "old a"}]))
+    assert convos.detect_agent(str(p)) == "codex"
+    msgs, meta, _ = convos.parse_messages(str(p), 0, convos.SessionMeta(session_id="x"))
+    assert [m.text for m in msgs] == ["old q", "old a"] and meta.session_id == CODEX_ID
+    # A Claude Code file is still Claude.
+    c = tmp_path / f"{SID}.jsonl"
+    c.write_bytes(_user("hi", "2026-09-10T10:00:00Z"))
+    assert convos.detect_agent(str(c)) == "claude"
+
+
+def test_codex_ingest_through_app(client, tmp_path):
+    d = tmp_path / "sessions" / "2026" / "11" / "01"
+    d.mkdir(parents=True)
+    (d / f"rollout-2026-11-01T09-00-00-{CODEX_ID}.jsonl").write_bytes(_codex_rollout())
+    rep = client.post("/ingest_convos", json={"convo_dir": str(tmp_path / "sessions")}).json()
+    assert rep["chunks_stored"] == 1 and not rep["errors"]
+    hits = client.post("/recall", json={"query": "mogi listing titles", "project": "diginom"}).json()["results"]
+    assert hits and hits[0]["session_id"] == CODEX_ID
+    assert hits[0]["metadata"]["agent"] == "codex"
+    assert "sandbox rules" not in hits[0]["content"] and "AGENTS.md" not in hits[0]["content"]
+    assert client.post("/forget", json={"source_prefix": f"convo:{CODEX_ID}"}).json()["deleted"] == 1
