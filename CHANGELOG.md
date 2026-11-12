@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- **MLX distributed clusters (`cloxy cluster`).** Shard one model across
+  several Macs with MLX's own stack: `setup` runs `mlx.distributed_config` to
+  discover Thunderbolt/Ethernet links and write a hostfile; `serve` runs
+  `mlx_lm server` under `mlx.launch` (JACCL RDMA over Thunderbolt 5 full mesh,
+  `jaccl-ring`, or TCP `ring`; tensor parallel, or `--pipeline`), rank 0
+  serving HTTP; `status` shows ranks and whether the upstream answers.
+- **Upstream LLM (`CLOXY_LLM_URL`).** `/v1/chat/completions` can forward to an
+  OpenAI-compatible server instead of loading MLX in-process — memory is still
+  injected here first. Streams relay with usage; an unreachable upstream is a
+  503/502, not a 200 that dies mid-stream. Verified end to end against a
+  2-rank `mlx.launch` cluster.
+
 - **Codex sessions.** The watcher now also follows `~/.codex/sessions` and
   ingests Codex CLI rollouts alongside Claude Code sessions: project from the
   session's cwd, git branch, timestamps. Developer instructions, the

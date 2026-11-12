@@ -18,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-from . import __version__, config, memory, proxy
+from . import __version__, backends, config, memory, proxy
 from . import push as pushmod
 from .convos import ingester, watcher
 from .memory import ChunkIn
@@ -50,14 +50,17 @@ async def _maybe_eager_load_llm():
     if not config.EAGER_LLM:
         return
     try:
-        from .backends import mlx_backend
+        if config.LLM_URL:
+            await backends.get().load_model(_configured_model())
+            logger.info(f"LLM upstream ready: {config.LLM_URL}")
+            return
         if not config.CONFIG_PATH.exists():
             logger.info("CLOXY_EAGER_LLM set but no config — run `cloxy init` first.")
             return
-        hf_id = json.loads(config.CONFIG_PATH.read_text()).get("model_hf_id")
+        hf_id = _configured_model()
         if hf_id:
             logger.info(f"Eagerly loading LLM: {hf_id}")
-            await mlx_backend.load_model(hf_id)
+            await backends.get().load_model(hf_id)
             logger.info("LLM ready.")
     except Exception as e:
         logger.warning(f"Eager LLM load failed: {e}")
@@ -461,9 +464,23 @@ class ChatCompletionRequest(BaseModel):
         return self.max_completion_tokens or self.max_tokens or DEFAULT_MAX_TOKENS
 
 
+def _configured_model() -> Optional[str]:
+    try:
+        return json.loads(config.CONFIG_PATH.read_text()).get("model_hf_id")
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 async def _ensure_llm_loaded():
-    from .backends import mlx_backend
-    if mlx_backend.is_loaded():
+    backend = backends.get()
+    if backend.is_loaded():
+        return
+    if config.LLM_URL:
+        from .backends.openai_backend import UpstreamError
+        try:
+            await backend.load_model(_configured_model())
+        except UpstreamError as e:
+            raise HTTPException(status_code=e.status, detail=str(e))
         return
     if not config.CONFIG_PATH.exists():
         raise HTTPException(status_code=503,
@@ -471,7 +488,7 @@ async def _ensure_llm_loaded():
     hf_id = json.loads(config.CONFIG_PATH.read_text()).get("model_hf_id")
     if not hf_id:
         raise HTTPException(status_code=503, detail="Config has no model_hf_id.")
-    await mlx_backend.load_model(hf_id)
+    await backend.load_model(hf_id)
 
 
 def _memory_block(hits: List[dict]) -> str:
@@ -506,20 +523,21 @@ async def _with_memory(req: ChatCompletionRequest, messages: List[dict]) -> List
 
 @app.get("/v1/models", dependencies=[Depends(check_auth)])
 async def list_models():
-    from .backends import mlx_backend
-    current = mlx_backend.current_model()
+    current = backends.get().current_model()
     if not current:
         return {"object": "list", "data": []}
+    owner = "cloxy-upstream" if config.LLM_URL else "cloxy-mlx"
     return {"object": "list", "data": [{
-        "id": current, "object": "model", "created": int(START_TIME), "owned_by": "cloxy-mlx",
+        "id": current, "object": "model", "created": int(START_TIME), "owned_by": owner,
     }]}
 
 
 @app.post("/v1/chat/completions", dependencies=[Depends(check_auth)])
 async def chat_completions(req: ChatCompletionRequest):
-    """OpenAI-compatible chat completions endpoint, MLX-backed."""
+    """OpenAI-compatible chat completions: in-process MLX, or the CLOXY_LLM_URL upstream."""
     await _ensure_llm_loaded()
-    from .backends import mlx_backend
+    backend = backends.get()
+    from .backends.openai_backend import UpstreamError
 
     role_map = {"developer": "system"}
     messages = [{"role": role_map.get(m.role, m.role), "content": m.text()} for m in req.messages]
@@ -527,21 +545,43 @@ async def chat_completions(req: ChatCompletionRequest):
     max_tokens = req.effective_max_tokens()
 
     if not req.stream:
-        return await mlx_backend.generate_chat(
-            messages=messages, max_tokens=max_tokens,
-            temperature=req.temperature, top_p=req.top_p)
+        try:
+            return await backend.generate_chat(
+                messages=messages, max_tokens=max_tokens,
+                temperature=req.temperature, top_p=req.top_p)
+        except UpstreamError as e:
+            raise HTTPException(status_code=e.status, detail=str(e))
+
+    # Pull the first piece before answering, so an unreachable upstream is an
+    # HTTP error and not a 200 that dies mid-stream.
+    pieces = backend.stream_chat(
+        messages=messages, max_tokens=max_tokens,
+        temperature=req.temperature, top_p=req.top_p,
+    )
+    try:
+        first = await pieces.__anext__()
+    except StopAsyncIteration:
+        first = None
+    except UpstreamError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
+
+    async def _all():
+        try:
+            if first is not None:
+                yield first
+                async for p in pieces:
+                    yield p
+        finally:
+            await pieces.aclose()   # stops the MLX producer thread on disconnect
 
     async def event_stream():
         completion_id = f"cloxy-{int(time.time() * 1000)}"
-        model_id = mlx_backend.current_model() or "unknown"
+        model_id = backend.current_model() or "unknown"
         finish_reason, usage = "stop", None
 
         # If the client disconnects, Starlette closes this generator, which
         # closes stream_chat, which signals the MLX producer thread to stop.
-        async for piece in mlx_backend.stream_chat(
-            messages=messages, max_tokens=max_tokens,
-            temperature=req.temperature, top_p=req.top_p,
-        ):
+        async for piece in _all():
             if piece.finish_reason:
                 finish_reason, usage = piece.finish_reason, piece.usage
             if not piece.text:

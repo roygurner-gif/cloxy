@@ -166,6 +166,28 @@ Continue.dev / Cursor: add an OpenAI-compatible model with base URL `http://loca
 
 Why MLX: it's Apple's framework for the unified-memory architecture, it runs in-process (no daemon, no HTTP hop between proxy and model), and it's fast on M-series parts. Cross-platform inference via `llama-cpp-python` is planned as a separate extra.
 
+### A model bigger than one Mac (MLX distributed / JACCL)
+
+Shard one model across several Macs with MLX's own distributed stack. Cloxy drives Apple's tools (`mlx.distributed_config`, `mlx.launch`, `mlx_lm server`); it does not shard anything itself:
+
+```bash
+# every Mac: same python path with cloxy[mlx] installed, passwordless ssh from this one
+cloxy cluster setup --hosts m4-a.local,m4-b.local,m4-c.local --backend jaccl-ring --auto-setup
+cloxy cluster serve --model mlx-community/Qwen3-235B-A22B-4bit      # rank 0 = first host, port 9056
+CLOXY_LLM_URL=http://m4-a.local:9056 cloxy start                      # memory + chat, cluster as the brain
+cloxy cluster status
+```
+
+| Backend | Link | When |
+|---|---|---|
+| `jaccl` | RDMA over Thunderbolt 5, every pair of Macs cabled | lowest latency; macOS 26.2+ with RDMA enabled |
+| `jaccl-ring` | RDMA over Thunderbolt 5, each Mac cabled to two neighbours | more Macs than TB ports |
+| `ring` | TCP over any network | always works, slowest |
+
+`setup` writes `~/.cloxy/hostfile.json` (RDMA devices per pair); `--auto-setup` lets mlx configure the Thunderbolt interfaces and needs sudo on each Mac. `serve` is tensor parallel by default, `--pipeline` splits layers instead; flags after `--` go to `mlx_lm server` (e.g. `-- --max-tokens 4096`). With `CLOXY_LLM_URL` set, `/v1/chat/completions` injects memory here and forwards to the cluster — no model loads in the cloxy process. The same variable works for any OpenAI-compatible server (Ollama, LM Studio, vLLM).
+
+> `mlx_lm server` has no auth; rank 0 binds `0.0.0.0`. Keep the cluster on a private network and expose only cloxy (with `CLOXY_API_KEY`).
+
 ## CLI
 
 ```
@@ -178,6 +200,9 @@ cloxy status                        health, memory, watcher
 cloxy reembed                       re-embed every memory (after changing model/prefix; server stopped)
 cloxy install-service | uninstall-service   launchd (macOS)
 cloxy init | show | list            local LLM setup
+cloxy cluster setup --hosts A,B,... [--over thunderbolt|ethernet] [--backend jaccl|jaccl-ring|ring] [--auto-setup]
+cloxy cluster serve [--model ID] [--port P] [--pipeline] [-- MLX_LM_SERVER_FLAGS]
+cloxy cluster status                 hostfile + whether CLOXY_LLM_URL answers
 ```
 
 ## Configuration
@@ -210,6 +235,12 @@ Everything is an environment variable.
 | `CLOXY_FETCH_TIMEOUT` | `30` | Web fetch timeout, seconds |
 | `CLOXY_CONFIG` | `~/.cloxy/config.json` | LLM config written by `cloxy init` |
 | `CLOXY_EAGER_LLM` | *(unset)* | `1` loads the LLM at startup |
+| `CLOXY_LLM_URL` | *(unset)* | Forward chat to this OpenAI-compatible server (e.g. a `cloxy cluster serve` rank 0) instead of in-process MLX |
+| `CLOXY_LLM_API_KEY` | *(unset)* | Sent upstream as `Authorization: Bearer` |
+| `CLOXY_LLM_TIMEOUT` | `600` | Upstream request timeout, seconds |
+| `CLOXY_HOSTFILE` | `~/.cloxy/hostfile.json` | MLX distributed hostfile for `cloxy cluster` |
+| `CLOXY_CLUSTER_BACKEND` | `jaccl` | Backend when neither `--backend` nor the hostfile names one |
+| `CLOXY_CLUSTER_PORT` | `9056` | Port `cloxy cluster serve` gives `mlx_lm server` |
 
 ## Security
 
