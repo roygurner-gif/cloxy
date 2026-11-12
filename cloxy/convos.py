@@ -1,8 +1,13 @@
 """
-Claude Code conversation ingest — incremental, metadata-aware, self-maintaining.
+Agent conversation ingest — incremental, metadata-aware, self-maintaining.
 
-Session files (`~/.claude/projects/<encoded-cwd>/<session>.jsonl`) are
-append-only. We track a byte offset per file and only re-read what's new:
+Two session formats are understood, detected per file:
+
+  - Claude Code: `~/.claude/projects/<encoded-cwd>/<session>.jsonl`
+  - Codex CLI:   `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`
+
+Both are append-only JSONL. We track a byte offset per file and only
+re-read what's new:
 
   - Messages are packed whole into ~CHUNK_SIZE groups. Every group but the
     last is *final* and committed; the last ("tail") is stored too so it is
@@ -32,9 +37,15 @@ logger = logging.getLogger("cloxy.convos")
 
 # Harness plumbing that shows up inside message text and adds nothing to memory.
 _STRIP_BLOCKS = re.compile(
-    r"<(system-reminder|local-command-caveat|local-command-stdout|command-message|command-args)>"
+    r"<(system-reminder|local-command-caveat|local-command-stdout|command-message|command-args"
+    r"|environment_context|user_instructions|INSTRUCTIONS)>"
     r".*?</\1>", re.DOTALL)
 _STRIP_TAGS = re.compile(r"</?command-name>")
+# Codex prepends the repo's AGENTS.md as a user message; it is config, not dialogue.
+_CODEX_PREAMBLE = ("# AGENTS.md instructions",)
+
+# Content block types that carry dialogue text (Claude: text; Codex: input/output_text).
+_TEXT_BLOCKS = ("text", "input_text", "output_text")
 
 
 @dataclass
@@ -51,6 +62,7 @@ class SessionMeta:
     project: Optional[str] = None
     git_branch: Optional[str] = None
     title: Optional[str] = None
+    agent: str = "claude"
 
 
 # =============================================================================
@@ -76,7 +88,7 @@ def message_text(content) -> str:
     elif isinstance(content, list):
         parts = []
         for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
+            if isinstance(block, dict) and block.get("type") in _TEXT_BLOCKS:
                 t = block.get("text", "").strip()
                 if t:
                     parts.append(t)
@@ -88,12 +100,79 @@ def message_text(content) -> str:
     return text.strip()
 
 
+def detect_agent(path: str) -> str:
+    """'codex' or 'claude', from the file name or, failing that, the first line."""
+    if os.path.basename(path).startswith("rollout-"):
+        return "codex"
+    try:
+        with open(path, "rb") as f:
+            first = json.loads(f.readline() or b"{}")
+    except (OSError, json.JSONDecodeError):
+        return "claude"
+    if isinstance(first, dict) and "sessionId" not in first and (
+            "payload" in first or ("instructions" in first and "id" in first)):
+        return "codex"
+    return "claude"
+
+
 def parse_messages(path: str, start: int, meta: SessionMeta) -> Tuple[List[Msg], SessionMeta, int]:
     """
     Parse complete lines from `start`. Returns (messages, updated meta,
     end offset of the last complete line). `meta` is updated in place from
-    whatever session fields appear (cwd, gitBranch, aiTitle).
+    whatever session fields appear (cwd, branch, title, session id).
     """
+    meta.agent = detect_agent(path)
+    if meta.agent == "codex":
+        return _parse_codex(path, start, meta)
+    return _parse_claude(path, start, meta)
+
+
+def _parse_codex(path: str, start: int, meta: SessionMeta) -> Tuple[List[Msg], SessionMeta, int]:
+    """
+    Codex rollout files: a `session_meta` line (id, cwd, git), then
+    `response_item` lines whose payload is a message, reasoning, or tool call.
+    Only user/assistant messages are kept; `event_msg` lines repeat them.
+    Older rollouts (before the envelope) put the items at top level.
+    """
+    msgs: List[Msg] = []
+    end = start
+    for end, line in iter_complete_lines(path, start):
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(d, dict):
+            continue
+        kind, p = d.get("type"), d.get("payload")
+        if not isinstance(p, dict):
+            # Legacy layout: header line {id, timestamp, instructions}, then bare items.
+            if "id" in d and "instructions" in d and "role" not in d:
+                meta.session_id = d["id"] or meta.session_id
+                continue
+            kind, p = "response_item", d
+        if kind == "session_meta":
+            meta.session_id = p.get("id") or meta.session_id
+            meta.project = p.get("cwd") or meta.project
+            git = p.get("git") or {}
+            if isinstance(git, dict) and git.get("branch"):
+                meta.git_branch = git["branch"]
+            continue
+        if kind == "turn_context":
+            meta.project = p.get("cwd") or meta.project
+            continue
+        if kind != "response_item" or p.get("type") != "message":
+            continue
+        role = p.get("role")
+        if role not in ("user", "assistant"):
+            continue                      # "developer"/"system" = harness instructions
+        text = message_text(p.get("content", ""))
+        if not text or text.startswith(_CODEX_PREAMBLE):
+            continue
+        msgs.append(Msg(role=role, text=text, ts=d.get("timestamp"), end_offset=end))
+    return msgs, meta, end
+
+
+def _parse_claude(path: str, start: int, meta: SessionMeta) -> Tuple[List[Msg], SessionMeta, int]:
     msgs: List[Msg] = []
     end = start
     for end, line in iter_complete_lines(path, start):
@@ -167,7 +246,8 @@ def render_group(group: List[Msg], meta: SessionMeta) -> str:
     bits = [_short_date(group[0].ts)]
     if meta.project:
         bits.append(os.path.basename(meta.project.rstrip("/")) or meta.project)
-    bits.append(meta.title or meta.session_id[:8])
+    label = meta.session_id[:8] if meta.agent == "claude" else f"{meta.agent} {meta.session_id[:8]}"
+    bits.append(meta.title or label)
     header = "[" + " · ".join(b for b in bits if b) + "]"
     body = "\n\n".join(
         f"{'USER' if m.role == 'user' else 'ASSISTANT'}: {m.text}" for m in group)
@@ -287,6 +367,7 @@ class ConvoIngester:
                 ts_start=g[0].ts, ts_end=g[-1].ts,
                 metadata={k: v for k, v in {
                     "title": meta.title, "git_branch": meta.git_branch, "path": path,
+                    "agent": meta.agent,
                 }.items() if v},
             )
 
@@ -315,7 +396,7 @@ class ConvoIngester:
         Ingest every *.jsonl under `dirs` that changed since last time.
         `on_file(path, report)` is called after each file (progress reporting).
         """
-        dirs = [os.path.expanduser(d) for d in (dirs or config.WATCH_DIRS)]
+        dirs = [os.path.expanduser(d) for d in (dirs or config.watch_dirs())]
         settle = config.WATCH_SETTLE if settle is None else settle
         summary = IngestSummary()
         files: List[Path] = []
@@ -367,15 +448,13 @@ class Watcher:
         }
 
     def start(self):
-        dirs = [d for d in config.WATCH_DIRS if os.path.isdir(d)]
-        self.status["dirs"] = dirs
-        if not dirs:
-            logger.info("Watcher: no session directories found; not starting "
-                        f"(looked in {config.WATCH_DIRS})")
-            return
+        # The inbox (sessions pushed from other machines) always exists, so the
+        # watcher always runs; agent dirs that appear later are picked up per pass.
+        os.makedirs(config.inbox_dir(), exist_ok=True)
+        self.status["dirs"] = config.watch_dirs()
         self.status["running"] = True
-        self.task = asyncio.create_task(self._loop(dirs), name="cloxy-watcher")
-        logger.info(f"Watcher: following {dirs} every {config.WATCH_INTERVAL:g}s")
+        self.task = asyncio.create_task(self._loop(), name="cloxy-watcher")
+        logger.info(f"Watcher: following {self.status['dirs']} every {config.WATCH_INTERVAL:g}s")
 
     async def stop(self):
         if self.task:
@@ -412,8 +491,10 @@ class Watcher:
         self.status["last_scan_at"] = datetime.now(timezone.utc).isoformat()
         self.status["last_scan_seconds"] = round(time.monotonic() - started, 3)
 
-    async def _loop(self, dirs: List[str]):
+    async def _loop(self):
         while True:
+            dirs = config.watch_dirs()
+            self.status["dirs"] = dirs
             await self.scan_once(dirs)
             await asyncio.sleep(config.WATCH_INTERVAL)
 

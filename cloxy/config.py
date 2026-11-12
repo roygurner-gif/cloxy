@@ -89,12 +89,34 @@ MAX_INGEST_CHARS = 2_000_000      # cap on a single /ingest_text payload
 RERANK = _flag("CLOXY_RERANK")
 RERANK_MODEL = os.environ.get("CLOXY_RERANK_MODEL", "Xenova/ms-marco-MiniLM-L-6-v2")
 
-# --- Conversation watcher (live ingest of Claude Code sessions) ---
+# --- Conversation watcher (live ingest of Claude Code + Codex sessions) ---
 WATCH = _flag("CLOXY_WATCH", "1")
 WATCH_DIRS = [
     os.path.expanduser(p) for p in
-    os.environ.get("CLOXY_WATCH_DIRS", "~/.claude/projects").split(os.pathsep) if p
+    os.environ.get("CLOXY_WATCH_DIRS", "~/.claude/projects:~/.codex/sessions").split(os.pathsep)
+    if p
 ]
+
+
+def inbox_dir() -> str:
+    """Where `cloxy push` from other machines lands: inbox/<host>/<agent>/<path>."""
+    return os.path.join(DATA_DIR, "inbox")
+
+
+def watch_dirs() -> list:
+    """The session directories that exist right now, the push inbox included."""
+    return [d for d in WATCH_DIRS + [inbox_dir()] if os.path.isdir(d)]
+
+
+# `cloxy push`: local session roots to mirror to CLOXY_URL, as agent=dir pairs.
+PUSH_SOURCES = [
+    (agent, os.path.expanduser(d)) for agent, d in
+    (pair.split("=", 1) for pair in os.environ.get(
+        "CLOXY_PUSH_SOURCES", "claude=~/.claude/projects,codex=~/.codex/sessions").split(",")
+     if "=" in pair)
+]
+PUSH_INTERVAL = float(os.environ.get("CLOXY_PUSH_INTERVAL", 10))
+PUSH_MAX_BYTES = 4_000_000        # raw bytes per /push request
 WATCH_INTERVAL = float(os.environ.get("CLOXY_WATCH_INTERVAL", 5))
 WATCH_SETTLE = 2.0                # seconds a file must be quiet before we read it
 

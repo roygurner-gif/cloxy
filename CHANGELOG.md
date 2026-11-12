@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- **Codex sessions.** The watcher now also follows `~/.codex/sessions` and
+  ingests Codex CLI rollouts alongside Claude Code sessions: project from the
+  session's cwd, git branch, timestamps. Developer instructions, the
+  environment/AGENTS.md preamble, reasoning, and tool calls are skipped. The
+  format is detected per file, and every memory records its `agent`.
+- **`cloxy push`.** Mirrors this machine's session files to a remote Cloxy
+  (`CLOXY_URL`) over HTTP with the same API key: only new complete lines,
+  byte-offset checked by the server (`POST /push`, 409 + resume point on a
+  mismatch), landing in `~/.cloxy/inbox/<host>/<agent>/`, which the watcher
+  always follows. Replaces the rsync-on-a-timer recipe.
+- **Watcher picks up new directories.** Session dirs that appear after
+  startup (e.g. installing Codex later) are found on the next pass.
+
 - **On PyPI.** `pipx install cloxy`. Releases publish from a `v*` tag via
   GitHub trusted publishing (`.github/workflows/release.yml`); the tag must
   match `cloxy.__version__`.
