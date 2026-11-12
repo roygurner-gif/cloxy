@@ -78,6 +78,7 @@ def client(tmp_path_factory):
     mp.setattr(config, "ALLOW_PRIVATE_URLS", False)
     mp.setattr(config, "RERANK", False)
     mp.setattr(config, "CHAT_MEMORY", False)
+    mp.setattr(config, "LLM_URL", "")         # in-process MLX unless a test opts in
     mp.setattr(memory, "init_embedder", lambda: setattr(memory, "embedder", FakeEmbedder()))
     mp.setattr(proxy.socket, "getaddrinfo", fake_getaddrinfo)
     mp.setattr(proxy, "_make_client",
