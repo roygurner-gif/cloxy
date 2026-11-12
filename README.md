@@ -184,7 +184,7 @@ cloxy cluster status
 | `jaccl-ring` | RDMA over Thunderbolt 5, each Mac cabled to two neighbours | more Macs than TB ports |
 | `ring` | TCP over any network | always works, slowest |
 
-`setup` writes `~/.cloxy/hostfile.json` (RDMA devices per pair); `--auto-setup` lets mlx configure the Thunderbolt interfaces and needs sudo on each Mac. `serve` is tensor parallel by default, `--pipeline` splits layers instead; flags after `--` go to `mlx_lm server` (e.g. `-- --max-tokens 4096`). With `CLOXY_LLM_URL` set, `/v1/chat/completions` injects memory here and forwards to the cluster — no model loads in the cloxy process. The same variable works for any OpenAI-compatible server (Ollama, LM Studio, vLLM).
+`setup` writes `~/.cloxy/hostfile.json` (RDMA devices per pair); `--auto-setup` lets mlx configure the Thunderbolt interfaces and needs sudo on each Mac. `serve` picks pipeline parallel (layers split, ~1 sync per token) on `ring` and tensor parallel on `jaccl` — tensor syncs every layer of every token, which only pays on RDMA (two M4 minis over Wi-Fi: tensor 0.85 tok/s, pipeline 27–36 tok/s). Override with `--pipeline` / `--tensor`; flags after `--` go to `mlx_lm server` (e.g. `-- --max-tokens 4096`). With `CLOXY_LLM_URL` set, `/v1/chat/completions` injects memory here and forwards to the cluster — no model loads in the cloxy process. The same variable works for any OpenAI-compatible server (Ollama, LM Studio, vLLM).
 
 > `mlx_lm server` has no auth; rank 0 binds `0.0.0.0`. Keep the cluster on a private network and expose only cloxy (with `CLOXY_API_KEY`).
 

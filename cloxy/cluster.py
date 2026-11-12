@@ -7,8 +7,8 @@ Cloxy doesn't shard models itself. It drives Apple's own tooling:
                                       links between the Macs and writes a
                                       hostfile (RDMA devices for JACCL)
   serve  → mlx.launch -- -m mlx_lm server
-                                      one process per Mac; tensor parallel by
-                                      default (--pipeline for pipeline), rank 0
+                                      one process per Mac; pipeline parallel on
+                                      ring, tensor parallel on jaccl, rank 0
                                       (the first host) answers HTTP
 
 Then run cloxy with CLOXY_LLM_URL pointing at rank 0, and memory-augmented
@@ -82,6 +82,18 @@ def serve_argv(model: str, hostfile: str, port: int, backend: Optional[str] = No
     if extra and extra[0] == "--":
         extra = extra[1:]
     return argv + extra
+
+
+def use_pipeline(backend: Optional[str], pipeline: bool = False, tensor: bool = False) -> bool:
+    """
+    Tensor parallel syncs every layer of every token, so it only pays off on
+    JACCL's microsecond RDMA. Over TCP (ring) each sync is a network round trip:
+    measured on two M4 minis over Wi-Fi, tensor ran 0.85 tok/s and pipeline
+    27-36 tok/s on the same model. Default: pipeline unless the backend is jaccl*.
+    """
+    if pipeline or tensor:
+        return pipeline
+    return not (backend or "").startswith("jaccl")
 
 
 def read_hostfile(path: str) -> dict:

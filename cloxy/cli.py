@@ -467,13 +467,14 @@ def cmd_cluster_serve(args: argparse.Namespace) -> int:
     hf = cluster.read_hostfile(args.hostfile)
     backend = args.backend or hf.get("backend") or config.CLUSTER_BACKEND
     url = cluster.rank0_url(hf, args.port)
+    pipeline = cluster.use_pipeline(backend, args.pipeline, args.tensor)
     print(f"Serving {model} on {len(hf.get('hosts') or [])} Macs over {backend} "
-          f"({'pipeline' if args.pipeline else 'tensor'} parallel).")
+          f"({'pipeline' if pipeline else 'tensor'} parallel).")
     if url:
         print(f"Point cloxy at it:  CLOXY_LLM_URL={url}  (or http://127.0.0.1:{args.port} "
               "if cloxy runs on rank 0)")
     return _run(cluster.serve_argv(model, args.hostfile, args.port, backend=backend,
-                                   pipeline=args.pipeline, python=args.python,
+                                   pipeline=pipeline, python=args.python,
                                    extra=args.extra, verbose=args.verbose))
 
 
@@ -568,8 +569,11 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--port", type=int, default=config.CLUSTER_PORT)
     c.add_argument("--backend", choices=BACKENDS,
                    help=f"default: the hostfile's, else {config.CLUSTER_BACKEND}")
-    c.add_argument("--pipeline", action="store_true",
-                   help="pipeline parallel (layers split) instead of tensor parallel")
+    mode = c.add_mutually_exclusive_group()
+    mode.add_argument("--pipeline", action="store_true",
+                      help="pipeline parallel: layers split, ~1 sync per token (default on ring)")
+    mode.add_argument("--tensor", action="store_true",
+                      help="tensor parallel: dozens of syncs per token (default on jaccl)")
     c.add_argument("--python", help="python on the remote Macs, if not this one's path")
     c.add_argument("--hostfile", default=config.HOSTFILE)
     c.add_argument("--verbose", action="store_true")

@@ -127,6 +127,14 @@ def test_serve_argv_runs_mlx_lm_server_under_mlx_launch():
                                  "--max-tokens", "2048"]
 
 
+def test_parallel_mode_follows_backend():
+    assert cluster.use_pipeline("ring") is True           # TCP: per-layer syncs kill tensor
+    assert cluster.use_pipeline("jaccl") is False
+    assert cluster.use_pipeline("jaccl-ring") is False
+    assert cluster.use_pipeline("jaccl", pipeline=True) is True
+    assert cluster.use_pipeline("ring", tensor=True) is False
+
+
 def test_setup_argv():
     argv = cluster.setup_argv("m1,m2,m3", "/h.json", backend="jaccl-ring", auto_setup=True)
     tail = argv[argv.index("--hosts"):]
@@ -162,6 +170,7 @@ def test_cluster_cli_wiring(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "_run", lambda argv: ran.append(argv) or 0)
     assert cli.main(["cluster", "serve", "--model", "m", "--hostfile", str(hf)]) == 0
     assert ran[0][ran[0].index("--backend") + 1] == "jaccl-ring"     # hostfile's backend
+    assert "--pipeline" not in ran[0]                                # jaccl → tensor
     assert "CLOXY_LLM_URL=http://a:" in capsys.readouterr().out
 
     assert cli.main(["cluster", "serve", "--model", "m",

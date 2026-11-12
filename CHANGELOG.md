@@ -6,7 +6,7 @@
   several Macs with MLX's own stack: `setup` runs `mlx.distributed_config` to
   discover Thunderbolt/Ethernet links and write a hostfile; `serve` runs
   `mlx_lm server` under `mlx.launch` (JACCL RDMA over Thunderbolt 5 full mesh,
-  `jaccl-ring`, or TCP `ring`; tensor parallel, or `--pipeline`), rank 0
+  `jaccl-ring`, or TCP `ring`; pipeline parallel on ring, tensor on jaccl), rank 0
   serving HTTP; `status` shows ranks and whether the upstream answers.
 - **Upstream LLM (`CLOXY_LLM_URL`).** `/v1/chat/completions` can forward to an
   OpenAI-compatible server instead of loading MLX in-process — memory is still
