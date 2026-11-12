@@ -199,7 +199,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     try:
         with _http() as c:
             h = c.get("/health").json()
-            s = c.get("/memory_stats").json()
+            r = c.get("/memory_stats")
+            if r.status_code == 401:
+                print(f"cloxy v{h['version']} at {config.URL} is up, but rejected the API key. "
+                      "Set CLOXY_API_KEY (or ~/.cloxy/client.env).")
+                return 1
+            s = r.json()
             w = c.get("/ingest_status").json()
     except httpx.ConnectError:
         return _not_running()

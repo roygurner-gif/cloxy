@@ -31,3 +31,16 @@ def test_service_plist_uses_console_script_and_data_dir(monkeypatch, tmp_path):
     assert env["CLOXY_API_KEY"] == "k" and env["FASTEMBED_CACHE_PATH"] == "/models"
     assert "UNRELATED" not in env and "PATH" in env
     assert plist["KeepAlive"] is True and plist["RunAtLoad"] is True
+
+
+def test_status_reports_bad_key_instead_of_crashing(monkeypatch, capsys):
+    import httpx
+
+    def handler(req):
+        if req.url.path == "/health":
+            return httpx.Response(200, json={"version": "9", "uptime": 1, "auth": "enabled"})
+        return httpx.Response(401, json={"detail": "Invalid or missing API key"})
+    monkeypatch.setattr(cli, "_http", lambda: httpx.Client(
+        base_url="http://x", transport=httpx.MockTransport(handler)))
+    assert cli.main(["status"]) == 1
+    assert "rejected the API key" in capsys.readouterr().out
