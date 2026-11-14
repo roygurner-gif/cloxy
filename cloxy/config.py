@@ -126,3 +126,17 @@ EAGER_LLM = _flag("CLOXY_EAGER_LLM")
 # Per-request override: {"memory": true|false} in the body.
 CHAT_MEMORY = _flag("CLOXY_CHAT_MEMORY")
 CHAT_MEMORY_TOP_K = int(os.environ.get("CLOXY_CHAT_MEMORY_TOP_K", 5))
+
+# --- Upstream / clustered LLM ---
+# Point chat at an OpenAI-compatible server instead of loading MLX in-process.
+# `cloxy cluster serve` starts one (mlx_lm.server under mlx.launch, sharded
+# across the hostfile's Macs over JACCL/ring); set this to its URL. Memory
+# injection still happens here, before the request leaves.
+LLM_URL = os.environ.get("CLOXY_LLM_URL", "").rstrip("/")
+LLM_API_KEY = os.environ.get("CLOXY_LLM_API_KEY", "")   # sent as Bearer if set
+LLM_TIMEOUT = float(os.environ.get("CLOXY_LLM_TIMEOUT", 600))
+
+# --- MLX distributed cluster (`cloxy cluster ...`) ---
+HOSTFILE = os.environ.get("CLOXY_HOSTFILE", os.path.join(DATA_DIR, "hostfile.json"))
+CLUSTER_BACKEND = os.environ.get("CLOXY_CLUSTER_BACKEND", "jaccl")
+CLUSTER_PORT = int(os.environ.get("CLOXY_CLUSTER_PORT", 9056))

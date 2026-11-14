@@ -11,6 +11,9 @@ Cloxy CLI.
   cloxy install-service    keep the server running via launchd (macOS)
   cloxy uninstall-service
   cloxy show / list        current LLM config / model catalog
+  cloxy cluster setup|serve|status
+                           shard one model across several Macs (MLX distributed:
+                           JACCL over Thunderbolt 5, or ring over TCP)
 """
 from __future__ import annotations
 
@@ -196,7 +199,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     try:
         with _http() as c:
             h = c.get("/health").json()
-            s = c.get("/memory_stats").json()
+            r = c.get("/memory_stats")
+            if r.status_code == 401:
+                print(f"cloxy v{h['version']} at {config.URL} is up, but rejected the API key. "
+                      "Set CLOXY_API_KEY (or ~/.cloxy/client.env).")
+                return 1
+            s = r.json()
             w = c.get("/ingest_status").json()
     except httpx.ConnectError:
         return _not_running()
@@ -418,6 +426,81 @@ def cmd_uninstall_service(args: argparse.Namespace) -> int:
 
 
 # =============================================================================
+# MLX distributed cluster
+# =============================================================================
+
+def _run(argv: list) -> int:
+    print("  $ " + " ".join(argv) + "\n", flush=True)
+    try:
+        return subprocess.call(argv)
+    except FileNotFoundError:
+        print("mlx is not installed here. Run: pip install 'cloxy[mlx]'")
+        return 1
+    except KeyboardInterrupt:
+        return 130
+
+
+def cmd_cluster_setup(args: argparse.Namespace) -> int:
+    from . import cluster
+    Path(args.hostfile).parent.mkdir(parents=True, exist_ok=True)
+    rc = _run(cluster.setup_argv(args.hosts, args.hostfile, over=args.over,
+                                 backend=args.backend, auto_setup=args.auto_setup,
+                                 verbose=args.verbose))
+    if rc == 0 and Path(args.hostfile).exists():
+        print(f"\nHostfile: {args.hostfile}")
+        for line in cluster.describe(cluster.read_hostfile(args.hostfile)):
+            print(line)
+        print("\nNext: cloxy cluster serve --model <hf-id>")
+    return rc
+
+
+def cmd_cluster_serve(args: argparse.Namespace) -> int:
+    from . import cluster
+    if not Path(args.hostfile).exists():
+        print(f"No hostfile at {args.hostfile}. Run `cloxy cluster setup --hosts a,b,...` "
+              "first (or pass --hostfile).")
+        return 1
+    model = args.model or (_read_config() or {}).get("model_hf_id")
+    if not model:
+        print("No model. Pass --model <hf-id> or run `cloxy init`.")
+        return 1
+    hf = cluster.read_hostfile(args.hostfile)
+    backend = args.backend or hf.get("backend") or config.CLUSTER_BACKEND
+    url = cluster.rank0_url(hf, args.port)
+    pipeline = cluster.use_pipeline(backend, args.pipeline, args.tensor)
+    print(f"Serving {model} on {len(hf.get('hosts') or [])} Macs over {backend} "
+          f"({'pipeline' if pipeline else 'tensor'} parallel).")
+    if url:
+        print(f"Point cloxy at it:  CLOXY_LLM_URL={url}  (or http://127.0.0.1:{args.port} "
+              "if cloxy runs on rank 0)")
+    return _run(cluster.serve_argv(model, args.hostfile, args.port, backend=backend,
+                                   pipeline=pipeline, python=args.python,
+                                   extra=args.extra, verbose=args.verbose))
+
+
+def cmd_cluster_status(args: argparse.Namespace) -> int:
+    import httpx
+    from . import cluster
+    if Path(args.hostfile).exists():
+        print(f"Hostfile: {args.hostfile}")
+        for line in cluster.describe(cluster.read_hostfile(args.hostfile)):
+            print(line)
+    else:
+        print(f"No hostfile at {args.hostfile}.")
+    if not config.LLM_URL:
+        print("CLOXY_LLM_URL not set — cloxy chat uses the in-process MLX model.")
+        return 0
+    headers = {"Authorization": f"Bearer {config.LLM_API_KEY}"} if config.LLM_API_KEY else {}
+    try:
+        r = httpx.get(f"{config.LLM_URL}/health", headers=headers, timeout=5)
+        state = "up" if r.status_code == 200 else f"HTTP {r.status_code}"
+    except httpx.HTTPError as e:
+        state = f"unreachable ({type(e).__name__})"
+    print(f"LLM upstream {config.LLM_URL}: {state}")
+    return 0 if state == "up" else 2
+
+
+# =============================================================================
 # Parser
 # =============================================================================
 
@@ -465,6 +548,42 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("reembed", help="Re-embed all memories after changing the embedding "
                    "model or prefix (server stopped)").set_defaults(func=cmd_reembed)
+
+    p = sub.add_parser("cluster", help="Shard one model across several Macs (MLX distributed)")
+    csub = p.add_subparsers(dest="cluster_cmd", required=True)
+    from .cluster import BACKENDS
+
+    c = csub.add_parser("setup", help="Discover links between the Macs and write a hostfile")
+    c.add_argument("--hosts", required=True, help="comma-separated ssh names; first = rank 0")
+    c.add_argument("--over", choices=["thunderbolt", "ethernet"], default="thunderbolt")
+    c.add_argument("--backend", choices=BACKENDS, default=None,
+                   help="jaccl = full TB5 mesh, jaccl-ring = TB5 ring (default: mlx picks)")
+    c.add_argument("--auto-setup", action="store_true",
+                   help="let mlx configure the Thunderbolt interfaces (needs sudo on each Mac)")
+    c.add_argument("--hostfile", default=config.HOSTFILE)
+    c.add_argument("--verbose", action="store_true")
+    c.set_defaults(func=cmd_cluster_setup)
+
+    c = csub.add_parser("serve", help="Run mlx_lm.server across the hostfile (rank 0 serves HTTP)")
+    c.add_argument("--model", help="Hugging Face MLX id (default: `cloxy init` model)")
+    c.add_argument("--port", type=int, default=config.CLUSTER_PORT)
+    c.add_argument("--backend", choices=BACKENDS,
+                   help=f"default: the hostfile's, else {config.CLUSTER_BACKEND}")
+    mode = c.add_mutually_exclusive_group()
+    mode.add_argument("--pipeline", action="store_true",
+                      help="pipeline parallel: layers split, ~1 sync per token (default on ring)")
+    mode.add_argument("--tensor", action="store_true",
+                      help="tensor parallel: dozens of syncs per token (default on jaccl)")
+    c.add_argument("--python", help="python on the remote Macs, if not this one's path")
+    c.add_argument("--hostfile", default=config.HOSTFILE)
+    c.add_argument("--verbose", action="store_true")
+    c.add_argument("extra", nargs=argparse.REMAINDER,
+                   help="after --, extra mlx_lm server flags (e.g. -- --max-tokens 2048)")
+    c.set_defaults(func=cmd_cluster_serve)
+
+    c = csub.add_parser("status", help="Show the hostfile and whether CLOXY_LLM_URL answers")
+    c.add_argument("--hostfile", default=config.HOSTFILE)
+    c.set_defaults(func=cmd_cluster_status)
 
     sub.add_parser("install-service", help="Run cloxy at login via launchd (macOS)") \
         .set_defaults(func=cmd_install_service)
