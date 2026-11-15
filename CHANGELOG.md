@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 5.2 — 2026-11-14
 
 - **MLX distributed clusters (`cloxy cluster`).** Shard one model across
   several Macs with MLX's own stack: `setup` runs `mlx.distributed_config` to
