@@ -113,7 +113,7 @@ Existing v3/v4 databases migrate in place on first start.
 | `POST` | `/fetch` | Fetch a URL. `{url, mode: clean\|raw\|markdown\|extract, selector?, headers?}` |
 | `POST` | `/search` | Fetch a URL, return lines containing a pattern |
 | `POST` | `/verify` | Fetch a URL, rank passages by semantic match to a claim |
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat (streaming or not). Extra: `memory`, `memory_top_k`, `memory_project` |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible chat (streaming or not). Extra: `memory`, `memory_top_k`, `memory_project`, `citations` |
 | `GET` | `/v1/models` | The currently loaded model |
 | `GET` | `/health` | Health + watcher summary |
 
@@ -159,6 +159,23 @@ resp = client.chat.completions.create(
 )
 print(resp.choices[0].message.content)
 ```
+
+#### Citations
+
+Ask for `"citations": true` (it implies `memory`) and the model is told to cite the injected memories inline as `[1]`, `[2]`. The response gains a `cloxy_citations` object (on the final chunk when streaming):
+
+```json
+{
+  "sources": [{"n": 1, "id": 412, "source": "fleischner-2017", "date": "2026-11-01",
+               "snippet": "Solid nodule <6 mm, low-risk: no routine follow-up…", "cited": true}],
+  "unknown": [],
+  "checks": [{"claim": "A 4 mm solid nodule needs no routine follow-up.", "cited": [1],
+              "support": {"1": 0.86}, "best_match": 1, "verdict": "ok"}],
+  "flagged": 0
+}
+```
+
+`checks` embeds each cited sentence against every injected source and flags it as `better_match_elsewhere` when a different source fits it better, or `unknown_source` when it cites a number that wasn't given. It catches mis-attributed citations; it does not prove a claim is true — a sentence that misstates its own source can still pass. Load reference material with `POST /ingest_text` (with a descriptive `source`) to make it citable.
 
 Continue.dev / Cursor: add an OpenAI-compatible model with base URL `http://localhost:9055/v1` and any API key (or your `CLOXY_API_KEY`).
 
@@ -230,6 +247,9 @@ Everything is an environment variable.
 | `CLOXY_RERANK_MODEL` | `Xenova/ms-marco-MiniLM-L-6-v2` | Reranker |
 | `CLOXY_CHAT_MEMORY` | *(unset)* | `1` to inject memory into every chat completion by default |
 | `CLOXY_CHAT_MEMORY_TOP_K` | `5` | How many memories to inject |
+| `CLOXY_CHAT_CITATIONS` | *(unset)* | `1` to ask for inline `[n]` citations + `cloxy_citations` by default |
+| `CLOXY_CITE_MARGIN` | `0.02` | How much better another source must match before a citation is flagged |
+| `CLOXY_CITE_WINDOW` | `300` | Source window size (chars) for the citation check |
 | `CLOXY_ALLOW_PRIVATE_URLS` | *(unset)* | `1` lets the proxy fetch private/loopback addresses (SSRF risk) |
 | `CLOXY_USER_AGENT` | Chrome UA | User agent for web requests |
 | `CLOXY_FETCH_TIMEOUT` | `30` | Web fetch timeout, seconds |

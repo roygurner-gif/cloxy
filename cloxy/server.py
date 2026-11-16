@@ -7,11 +7,12 @@ Run with `cloxy start` (or `python -m cloxy start`).
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
@@ -459,6 +460,8 @@ class ChatCompletionRequest(BaseModel):
     memory: Optional[bool] = None            # default: CLOXY_CHAT_MEMORY
     memory_top_k: int = Field(config.CHAT_MEMORY_TOP_K, ge=1, le=20)
     memory_project: Optional[str] = None
+    # Cite recalled memory inline as [n]; response carries `cloxy_citations`.
+    citations: Optional[bool] = None         # default: CLOXY_CHAT_CITATIONS
 
     def effective_max_tokens(self) -> int:
         return self.max_completion_tokens or self.max_tokens or DEFAULT_MAX_TOKENS
@@ -491,34 +494,160 @@ async def _ensure_llm_loaded():
     await backend.load_model(hf_id)
 
 
-def _memory_block(hits: List[dict]) -> str:
-    lines = ["Relevant memory from past conversations (most relevant first). "
-             "Use it when it helps; ignore it when it doesn't."]
+CITE_INSTRUCTIONS = (
+    "Numbered sources from memory (most relevant first). When a statement relies on "
+    "a source, cite it inline right after the statement as [n], e.g. [2] or [1][3]. "
+    "Only cite numbers listed below. If the sources don't support an answer, say so "
+    "plainly instead of guessing, and don't cite anything for general knowledge.")
+
+
+def _hit_tag(h: dict, with_source: bool = False) -> str:
+    parts = [(h.get("ts_start") or "")[:10],
+             os.path.basename((h.get("project") or "").rstrip("/"))]
+    if with_source:
+        parts.append(h.get("source") or "")
+    return " · ".join(b for b in parts if b)
+
+
+def _memory_block(hits: List[dict], cite: bool = False) -> str:
+    head = CITE_INSTRUCTIONS if cite else (
+        "Relevant memory from past conversations (most relevant first). "
+        "Use it when it helps; ignore it when it doesn't.")
+    lines = [head]
     for i, h in enumerate(hits, 1):
-        tag = " · ".join(b for b in (
-            (h.get("ts_start") or "")[:10],
-            os.path.basename((h.get("project") or "").rstrip("/")),
-        ) if b)
+        tag = _hit_tag(h, with_source=cite)
         body = h["content"] if len(h["content"]) <= 1200 else h["content"][:1200] + " …"
         lines.append(f"{i}. [{tag}] {body}" if tag else f"{i}. {body}")
     return "\n\n".join(lines)
 
 
-async def _with_memory(req: ChatCompletionRequest, messages: List[dict]) -> List[dict]:
-    """Prepend a system block of recalled memory keyed on the last user message."""
+_CITE_RE = re.compile(r"\[(\d{1,2})\]")
+
+
+def _citations(hits: List[dict], answer: str) -> dict:
+    """Map each [n] in the answer back to the memory it points at.
+
+    `sources` lists every injected memory with `cited` set when the answer used
+    it; `unknown` lists numbers the model cited that don't exist (a red flag
+    worth surfacing to the reader).
+    """
+    used = {int(n) for n in _CITE_RE.findall(answer or "")}
+    sources = []
+    for i, h in enumerate(hits, 1):
+        snippet = " ".join(h["content"].split())
+        sources.append({
+            "n": i,
+            "id": h.get("id"),
+            "source": h.get("source"),
+            "project": h.get("project"),
+            "session_id": h.get("session_id"),
+            "date": (h.get("ts_start") or "")[:10] or None,
+            "snippet": snippet if len(snippet) <= 280 else snippet[:280] + " …",
+            "cited": i in used,
+        })
+    return {"sources": sources,
+            "unknown": sorted(n for n in used if not 1 <= n <= len(hits))}
+
+
+_SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+
+
+def _cited_claims(answer: str) -> List[Tuple[str, List[int]]]:
+    """Split the answer into sentences and keep the ones carrying [n] markers."""
+    out = []
+    for sent in _SENTENCE_RE.split(answer or ""):
+        nums = [int(n) for n in _CITE_RE.findall(sent)]
+        text = " ".join(_CITE_RE.sub("", sent).split())
+        if nums and text:
+            out.append((text, sorted(set(nums))))
+    return out
+
+
+async def _check_citations(hits: List[dict], answer: str) -> List[dict]:
+    """Does each cited sentence actually match the source it cites?
+
+    Embeds every cited sentence and small windows of every injected source, then
+    asks which source matches the sentence best. A citation is flagged when the
+    best-matching source isn't one of the cited ones (beyond a small margin), or
+    when it points at a number that doesn't exist. Heuristic, not proof: it
+    catches mis-attributed citations, not every wrong claim.
+    """
+    import numpy as np
+    claims = _cited_claims(answer)
+    if not claims or not hits:
+        return []
+    windows, owner = [], []
+    for i, h in enumerate(hits, 1):
+        for w in memory.chunk_text(h["content"], size=config.CITE_WINDOW,
+                                   overlap=config.CITE_WINDOW // 5) or [h["content"]]:
+            windows.append(config.EMBED_PASSAGE_PREFIX + w)
+            owner.append(i)
+    embs = await memory.aembed_batch(
+        windows + [config.EMBED_QUERY_PREFIX + c for c, _ in claims])
+    mat = np.vstack(embs).astype(np.float32)
+    mat /= np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-9)
+    win, qs = mat[:len(windows)], mat[len(windows):]
+    sims = qs @ win.T                                   # (claims, windows)
+    owner_arr = np.array(owner)
+
+    report = []
+    for (text, cited), row in zip(claims, sims):
+        per_src = {n: round(float(row[owner_arr == n].max()), 4) for n in range(1, len(hits) + 1)}
+        best_n = max(per_src, key=per_src.get)
+        valid = [n for n in cited if n in per_src]
+        cited_best = max((per_src[n] for n in valid), default=None)
+        if len(valid) < len(cited):
+            verdict = "unknown_source"
+        elif cited_best is not None and per_src[best_n] - cited_best > config.CITE_MARGIN:
+            verdict = "better_match_elsewhere"
+        else:
+            verdict = "ok"
+        report.append({
+            "claim": text if len(text) <= 300 else text[:300] + " …",
+            "cited": cited,
+            "support": {n: per_src[n] for n in valid},
+            "best_match": best_n,
+            "verdict": verdict,
+        })
+    return report
+
+
+async def _citation_payload(hits: List[dict], answer: str) -> dict:
+    out = _citations(hits, answer)
+    try:
+        out["checks"] = await _check_citations(hits, answer)
+    except Exception as e:                      # never fail the chat over the check
+        logger.warning(f"citation check failed: {e}")
+        out["checks"], out["check_error"] = [], str(e)
+    out["flagged"] = sum(c["verdict"] != "ok" for c in out["checks"])
+    return out
+
+
+async def _with_memory(req: ChatCompletionRequest,
+                       messages: List[dict]) -> Tuple[List[dict], List[dict], bool]:
+    """Prepend a system block of recalled memory keyed on the last user message.
+
+    Returns (messages, hits, cite). `cite` is True only when citations were asked
+    for and there was memory to cite.
+    """
     use = config.CHAT_MEMORY if req.memory is None else req.memory
+    cite = config.CHAT_CITATIONS if req.citations is None else req.citations
+    if req.citations and req.memory is None:
+        use = True                          # asking for citations implies memory
     if not use:
-        return messages
+        return messages, [], False
     last_user = next((m["content"] for m in reversed(messages) if m["role"] == "user"), "")
     if not last_user.strip():
-        return messages
+        return messages, [], False
     hits = await memory.search(last_user, top_k=req.memory_top_k, project=req.memory_project)
     if not hits:
-        return messages
-    block = _memory_block(hits)
+        return messages, [], False
+    block = _memory_block(hits, cite=cite)
     if messages and messages[0]["role"] == "system":
-        return [{"role": "system", "content": messages[0]["content"] + "\n\n" + block}] + messages[1:]
-    return [{"role": "system", "content": block}] + messages
+        merged = [{"role": "system", "content": messages[0]["content"] + "\n\n" + block}] + messages[1:]
+    else:
+        merged = [{"role": "system", "content": block}] + messages
+    return merged, hits, cite
 
 
 @app.get("/v1/models", dependencies=[Depends(check_auth)])
@@ -541,16 +670,21 @@ async def chat_completions(req: ChatCompletionRequest):
 
     role_map = {"developer": "system"}
     messages = [{"role": role_map.get(m.role, m.role), "content": m.text()} for m in req.messages]
-    messages = await _with_memory(req, messages)
+    messages, hits, cite = await _with_memory(req, messages)
     max_tokens = req.effective_max_tokens()
 
     if not req.stream:
         try:
-            return await backend.generate_chat(
+            out = await backend.generate_chat(
                 messages=messages, max_tokens=max_tokens,
                 temperature=req.temperature, top_p=req.top_p)
         except UpstreamError as e:
             raise HTTPException(status_code=e.status, detail=str(e))
+        if cite:
+            choices = out.get("choices") or [{}]
+            answer = (choices[0].get("message") or {}).get("content") or ""
+            out["cloxy_citations"] = await _citation_payload(hits, answer)
+        return out
 
     # Pull the first piece before answering, so an unreachable upstream is an
     # HTTP error and not a 200 that dies mid-stream.
@@ -578,6 +712,7 @@ async def chat_completions(req: ChatCompletionRequest):
         completion_id = f"cloxy-{int(time.time() * 1000)}"
         model_id = backend.current_model() or "unknown"
         finish_reason, usage = "stop", None
+        answer = []
 
         # If the client disconnects, Starlette closes this generator, which
         # closes stream_chat, which signals the MLX producer thread to stop.
@@ -586,6 +721,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 finish_reason, usage = piece.finish_reason, piece.usage
             if not piece.text:
                 continue
+            answer.append(piece.text)
             chunk = {
                 "id": completion_id, "object": "chat.completion.chunk",
                 "created": int(time.time()), "model": model_id,
@@ -600,6 +736,9 @@ async def chat_completions(req: ChatCompletionRequest):
         }
         if usage:
             final["usage"] = usage
+        if cite:
+            # Citations need the whole answer, so they ride on the last chunk.
+            final["cloxy_citations"] = await _citation_payload(hits, "".join(answer))
         yield f"data: {json.dumps(final)}\n\n"
         yield "data: [DONE]\n\n"
 

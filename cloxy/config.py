@@ -126,6 +126,14 @@ EAGER_LLM = _flag("CLOXY_EAGER_LLM")
 # Per-request override: {"memory": true|false} in the body.
 CHAT_MEMORY = _flag("CLOXY_CHAT_MEMORY")
 CHAT_MEMORY_TOP_K = int(os.environ.get("CLOXY_CHAT_MEMORY_TOP_K", 5))
+# Ask the model to cite injected memory inline as [n] and return the sources
+# behind each number. Per-request override: {"citations": true|false}.
+CHAT_CITATIONS = _flag("CLOXY_CHAT_CITATIONS")
+# Citation check: sources are compared in windows of this many chars, and a
+# citation is flagged when another source matches the sentence better by more
+# than this cosine margin (embedding sims are compressed, so keep it small).
+CITE_WINDOW = int(os.environ.get("CLOXY_CITE_WINDOW", 300))
+CITE_MARGIN = float(os.environ.get("CLOXY_CITE_MARGIN", 0.02))
 
 # --- Upstream / clustered LLM ---
 # Point chat at an OpenAI-compatible server instead of loading MLX in-process.

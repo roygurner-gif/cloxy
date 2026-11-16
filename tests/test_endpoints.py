@@ -1,4 +1,5 @@
 """Endpoint tests through the TestClient fixture in conftest.py."""
+import json
 from cloxy import config, memory, proxy, server
 
 
@@ -215,3 +216,79 @@ def test_ingest_and_recall_use_passage_and_query_prefixes(client, monkeypatch):
     assert r.status_code == 200
     assert seen[0].startswith("passage: ") and "prefix probe alpha" in seen[0]
     assert seen[-1] == "query: prefix probe"
+
+
+# ---------------------------------------------------------------------------
+# citations: [n] markers → sources, plus the mis-attribution check
+# ---------------------------------------------------------------------------
+
+GUIDE = "Fleischner guideline: solid nodule under 6 mm in a low risk patient needs no routine follow up."
+TACO = "Lunch plan: birria tacos from the truck on Thursday near the office."
+
+
+def _fake_backend(answer, seen):
+    from types import SimpleNamespace
+    from cloxy.backends.mlx_backend import StreamPiece
+
+    async def generate_chat(messages, **kw):
+        seen.append(messages)
+        return {"id": "x", "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": answer},
+                             "finish_reason": "stop"}]}
+
+    async def stream_chat(messages, **kw):
+        seen.append(messages)
+        for word in answer.split(" "):
+            yield StreamPiece(text=word + " ")
+        yield StreamPiece(text="", finish_reason="stop")
+
+    return SimpleNamespace(is_loaded=lambda: True, current_model=lambda: "fake",
+                           generate_chat=generate_chat, stream_chat=stream_chat)
+
+
+def test_citations_map_numbers_to_sources():
+    hits = [{"id": 7, "content": GUIDE, "source": "fleischner-2017", "project": None,
+             "session_id": None, "ts_start": "2026-11-01T00:00:00Z"},
+            {"id": 8, "content": TACO, "source": "notes", "project": None,
+             "session_id": None, "ts_start": None}]
+    out = server._citations(hits, "No follow up needed [1]. Also see [4].")
+    assert [s["cited"] for s in out["sources"]] == [True, False]
+    assert out["sources"][0]["source"] == "fleischner-2017" and out["sources"][0]["date"] == "2026-11-01"
+    assert out["unknown"] == [4]
+    assert server._cited_claims("A thing [1]. Plain sentence. B [2][1].") == [
+        ("A thing .", [1]), ("B .", [1, 2])]
+    block = server._memory_block(hits, cite=True)
+    assert "cite it inline" in block and "fleischner-2017" in block
+
+
+def test_chat_citations_end_to_end(client, monkeypatch):
+    client.post("/ingest_text", json={"text": GUIDE, "source": "cite-fleischner"})
+    client.post("/ingest_text", json={"text": TACO, "source": "cite-notes"})
+    hits = client.post("/recall", json={"query": "solid nodule follow up tacos", "top_k": 2}).json()["results"]
+    n_guide = 1 + [h["content"] for h in hits].index(GUIDE)
+    n_taco = 3 - n_guide
+    answer = (f"A solid nodule under 6 mm in a low risk patient needs no routine follow up [{n_guide}]. "
+              f"Solid nodule follow up is not needed under 6 mm [{n_taco}]. Bogus [9].")
+    seen = []
+    monkeypatch.setattr(server.backends, "get", lambda: _fake_backend(answer, seen))
+    body = {"messages": [{"role": "user", "content": "solid nodule follow up tacos"}],
+            "citations": True, "memory_top_k": 2}
+
+    out = client.post("/v1/chat/completions", json=body).json()
+    assert "cite it inline" in seen[-1][0]["content"]          # citations imply memory
+    cit = out["cloxy_citations"]
+    assert cit["unknown"] == [9]
+    verdicts = [c["verdict"] for c in cit["checks"]]
+    assert verdicts == ["ok", "better_match_elsewhere", "unknown_source"]
+    assert cit["checks"][1]["best_match"] == n_guide and cit["flagged"] == 2
+
+    # streaming: same payload rides on the final chunk
+    r = client.post("/v1/chat/completions", json={**body, "stream": True})
+    events = [json.loads(l[6:]) for l in r.text.splitlines()
+              if l.startswith("data: {")]
+    assert events[-1]["cloxy_citations"]["flagged"] == 2
+
+    # off by default: no payload, old memory wording
+    out = client.post("/v1/chat/completions", json={**body, "citations": None, "memory": True}).json()
+    assert "cloxy_citations" not in out and "cite it inline" not in seen[-1][0]["content"]
+    client.post("/forget", json={"source_prefix": "cite-"})
